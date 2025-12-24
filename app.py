@@ -9,7 +9,7 @@ import oandapyV20.endpoints.instruments as instruments
 # ==========================================
 # CONFIGURATION ET STYLE
 # ==========================================
-st.set_page_config(page_title="Bluestar Currency Strength (OANDA)", layout="wide")
+st.set_page_config(page_title="Bluestar Currency Strength", layout="wide")
 
 # Couleurs
 COLORS = {
@@ -22,54 +22,53 @@ st.markdown("via **OANDA API**")
 st.markdown("---")
 
 # ==========================================
-# GESTION DES SECRETS & SIDEBAR
+# GESTION DES SECRETS (Correction ici)
 # ==========================================
 with st.sidebar:
     st.header("🔑 Connexion OANDA")
     
-    # 1. Vérification si les secrets existent
-    has_secrets = "oanda" in st.secrets
+    # 1. Chargement depuis les Secrets avec vos clés spécifiques
+    secret_token = st.secrets.get("OANDA_ACCESS_TOKEN", None)
+    secret_account = st.secrets.get("OANDA_ACCOUNT_ID", None)
     
-    if has_secrets:
-        st.success("✅ Identifiants chargés depuis les Secrets Streamlit")
-        # On récupère les infos depuis les secrets
-        access_token = st.secrets["oanda"]["token"]
-        # Par défaut "practice" si non spécifié
-        environment = st.secrets["oanda"].get("type", "practice") 
+    if secret_token:
+        st.success(f"✅ Token chargé depuis les secrets")
+        if secret_account:
+            st.caption(f"ID Compte : {secret_account}")
+        access_token = secret_token
     else:
-        # Sinon, on demande manuellement
-        st.info("Aucun secret détecté. Entrez vos infos manuellement.")
-        access_token = st.text_input("Token d'accès API", type="password")
-        environment = st.selectbox("Type de Compte", ["practice", "live"], index=0)
+        st.info("Aucun secret trouvé. Entrez le token manuellement.")
+        access_token = st.text_input("OANDA Access Token", type="password")
+
+    # Choix de l'environnement (Important car le token diffère entre Practice et Live)
+    environment = st.selectbox("Environnement", ["practice", "live"], index=0, 
+                             help="Practice = Compte Démo, Live = Compte Réel")
     
     st.markdown("---")
-    st.header("⚙️ Paramètres Indicateur")
+    st.header("⚙️ Paramètres")
     
     granularity = st.selectbox("Unité de temps", ["M15", "M30", "H1", "H4", "D", "W"], index=4)
     length_input = st.number_input("Période RSI", min_value=1, max_value=100, value=14)
     smoothing = st.number_input("Lissage (Moyenne Mobile)", min_value=1, max_value=10, value=3)
-    lookback = st.slider("Nombre de bougies affichées", 30, 500, 100)
+    lookback = st.slider("Bougies affichées", 30, 500, 100)
 
 # ==========================================
-# FONCTIONS DE CALCUL
+# FONCTIONS
 # ==========================================
 
 def calculate_rsi(series, period):
-    """Calcule le RSI manuellement"""
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).fillna(0)
     loss = (-delta.where(delta < 0, 0)).fillna(0)
-    
     avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_oanda_data(token, env, granular, count=500):
-    """Récupère les données via l'API OANDA"""
+def fetch_oanda_data(token, env, granular, count):
+    """Récupère les données OANDA. Note: L'Account ID n'est pas nécessaire pour lire les bougies."""
     
     pairs_list = [
         "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "USD_CAD", "NZD_USD",
@@ -82,7 +81,7 @@ def fetch_oanda_data(token, env, granular, count=500):
     try:
         client = API(access_token=token, environment=env)
     except Exception as e:
-        return None, f"Erreur de connexion API. Vérifiez votre token. Détails: {str(e)}"
+        return None, f"Erreur d'initialisation API : {str(e)}"
 
     df_dict = {}
     params = {"count": count + 50, "granularity": granular, "price": "M"}
@@ -91,7 +90,7 @@ def fetch_oanda_data(token, env, granular, count=500):
     status_text = st.empty()
     
     for idx, pair in enumerate(pairs_list):
-        status_text.text(f"Récupération {pair}...")
+        status_text.text(f"Téléchargement {pair}...")
         try:
             r = instruments.InstrumentsCandles(instrument=pair, params=params)
             client.request(r)
@@ -111,7 +110,7 @@ def fetch_oanda_data(token, env, granular, count=500):
             df_dict[pair] = temp_df[pair]
             
         except Exception:
-            pass # On ignore silencieusement les paires manquantes pour ne pas bloquer
+            pass 
         
         progress_bar.progress((idx + 1) / len(pairs_list))
     
@@ -119,14 +118,13 @@ def fetch_oanda_data(token, env, granular, count=500):
     progress_bar.empty()
 
     if not df_dict:
-        return None, "Aucune donnée récupérée. Vérifiez que votre compte (Demo/Live) correspond au token."
+        return None, "Échec de récupération. Vérifiez si votre Token correspond bien à l'environnement choisi (Practice vs Live)."
 
     full_df = pd.DataFrame(df_dict)
     full_df = full_df.fillna(method='ffill').fillna(method='bfill')
     return full_df, None
 
 def calculate_strength(df, length, smooth):
-    """Calcule la force relative"""
     currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
     strength_df = pd.DataFrame(index=df.index)
     
@@ -138,8 +136,8 @@ def calculate_strength(df, length, smooth):
         for opp in opponents:
             pair_direct = f"{curr}_{opp}"
             pair_inverse = f"{opp}_{curr}"
-            rsi_series = None
             
+            rsi_series = None
             if pair_direct in df.columns:
                 rsi_series = calculate_rsi(df[pair_direct], length)
             elif pair_inverse in df.columns:
@@ -156,13 +154,13 @@ def calculate_strength(df, length, smooth):
     return strength_df.dropna()
 
 # ==========================================
-# EXÉCUTION
+# MAIN EXECUTION
 # ==========================================
 
 if not access_token:
-    st.warning("👈 Veuillez configurer vos identifiants OANDA (Secrets ou Sidebar).")
+    st.warning("Veuillez configurer OANDA_ACCESS_TOKEN dans les secrets ou l'entrer manuellement.")
 else:
-    df_prices, error_msg = fetch_oanda_data(access_token, environment, granularity, count=lookback+100)
+    df_prices, error_msg = fetch_oanda_data(access_token, environment, granularity, lookback+100)
     
     if error_msg:
         st.error(error_msg)
@@ -170,7 +168,7 @@ else:
         df_strength = calculate_strength(df_prices, length_input, smoothing)
         df_display = df_strength.tail(lookback)
         
-        # Graphique
+        # 1. Graphique
         fig = go.Figure()
         for col in df_display.columns:
             fig.add_trace(go.Scatter(x=df_display.index, y=df_display[col], 
@@ -183,8 +181,8 @@ else:
         fig.update_layout(title=f"Currency Strength ({granularity})", template="plotly_dark", height=600, yaxis=dict(range=[0, 10]))
         st.plotly_chart(fig, use_container_width=True)
         
-        # Tableau
-        st.subheader("Classement en temps réel")
+        # 2. Tableau
+        st.subheader("Classement Actuel")
         last_values = df_display.iloc[-1].sort_values(ascending=False)
         rank_df = pd.DataFrame({"Devise": last_values.index, "Force": last_values.values})
         rank_df["Rang"] = range(1, len(rank_df) + 1)
