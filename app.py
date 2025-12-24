@@ -1,211 +1,266 @@
-//@version=5
-indicator("💎 Bluestar Currency Strength Meter", overlay=false, max_bars_back=500)
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import oandapyV20
+from oandapyV20 import API
+import oandapyV20.endpoints.instruments as instruments
+from requests.exceptions import ConnectionError
 
-// ==========================================
-// CONFIGURATION
-// ==========================================
-lengthInput = input.int(14, "Période de Calcul", minval=1, maxval=100)
-smoothing = input.int(3, "Lissage", minval=1, maxval=10)
-showTable = input.bool(true, "Afficher Tableau", group="Affichage")
-tablePosition = input.string("top_right", "Position Tableau", 
-    options=["top_left", "top_center", "top_right", "middle_left", "middle_center", 
-    "middle_right", "bottom_left", "bottom_center", "bottom_right"], group="Affichage")
+# ==========================================
+# CONFIGURATION ET STYLE
+# ==========================================
+st.set_page_config(page_title="Bluestar Currency Strength (OANDA)", layout="wide")
 
-// ==========================================
-// FONCTION: RÉCUPÉRATION SÉCURISÉE DES PAIRES
-// ==========================================
-// ✅ CORRECTION: Utiliser uniquement les paires valides OANDA
-getPairData(base, quote) =>
-    // Construire le symbole dans le bon ordre (OANDA utilise BASE_QUOTE)
-    pair = base + quote
-    
-    // Vérifier si la paire existe en format standard
-    validPairs = array.from(
-        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "AUDUSD", "USDCAD", "NZDUSD",
-        "EURGBP", "EURJPY", "EURCHF", "EURCAD", "EURAUD", "EURNZD",
-        "GBPJPY", "GBPCHF", "GBPCAD", "GBPAUD", "GBPNZD",
-        "AUDJPY", "AUDCAD", "AUDCHF", "AUDNZD",
-        "CADJPY", "CADCHF", "NZDJPY", "NZDCAD", "NZDCHF", "CHFJPY")
-    
-    pairExists = array.includes(validPairs, pair)
-    
-    // Si la paire existe, récupérer les données
-    if pairExists
-        [close, high, low] = request.security("OANDA:" + pair, timeframe.period, [close, high, low], 
-            gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
-        [close, high, low, true]
-    else
-        // Essayer la paire inversée
-        inversePair = quote + base
-        inverseExists = array.includes(validPairs, inversePair)
-        
-        if inverseExists
-            [c, h, l] = request.security("OANDA:" + inversePair, timeframe.period, [close, high, low],
-                gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
-            // ✅ Inverser les valeurs pour obtenir la cotation correcte
-            [1/c, 1/l, 1/h, true]
-        else
-            [na, na, na, false]
+# Couleurs (Design conservé)
+COLORS = {
+    "USD": "#2962FF", "EUR": "#00E676", "GBP": "#FF6D00", "JPY": "#AA00FF",
+    "AUD": "#00B0FF", "CAD": "#FF1744", "NZD": "#FFEA00", "CHF": "#00C853"
+}
 
-// ==========================================
-// FONCTION: CALCUL DE LA FORCE D'UNE DEVISE
-// ==========================================
-calcCurrencyStrength(currency) =>
-    var opponents = array.new_string(0)
+st.title("💎 Bluestar Currency Strength Meter")
+st.markdown("via **OANDA API**")
+st.markdown("---")
+
+# ==========================================
+# BARRE LATÉRALE (INPUTS)
+# ==========================================
+with st.sidebar:
+    st.header("🔑 Connexion OANDA")
     
-    // Définir les devises opposées
-    if currency == "USD"
-        opponents := array.from("EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD")
-    else if currency == "EUR"
-        opponents := array.from("USD", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD")
-    else if currency == "GBP"
-        opponents := array.from("USD", "EUR", "JPY", "CHF", "AUD", "CAD", "NZD")
-    else if currency == "JPY"
-        opponents := array.from("USD", "EUR", "GBP", "CHF", "AUD", "CAD", "NZD")
-    else if currency == "AUD"
-        opponents := array.from("USD", "EUR", "GBP", "JPY", "CHF", "CAD", "NZD")
-    else if currency == "CAD"
-        opponents := array.from("USD", "EUR", "GBP", "JPY", "CHF", "AUD", "NZD")
-    else if currency == "NZD"
-        opponents := array.from("USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD")
-    else if currency == "CHF"
-        opponents := array.from("USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD")
+    # Inputs pour l'API
+    access_token = st.text_input("Token d'accès API", type="password", help="Votre token personnel OANDA (fxTrade Practice ou Live)")
+    environment = st.selectbox("Type de Compte", ["practice", "live"], index=0)
     
-    strength = 0.0
-    validPairs = 0
+    st.markdown("---")
+    st.header("⚙️ Paramètres Indicateur")
     
-    // Calculer la force relative contre chaque devise
-    for i = 0 to array.size(opponents) - 1
-        opponent = array.get(opponents, i)
-        [closePrice, highPrice, lowPrice, isValid] = getPairData(currency, opponent)
-        
-        if isValid and not na(closePrice)
-            // Calculer le RSI pour cette paire
-            change = ta.change(closePrice)
-            gain = change >= 0 ? change : 0.0
-            loss = change < 0 ? -change : 0.0
+    granularity = st.selectbox("Unité de temps", ["M15", "M30", "H1", "H4", "D", "W"], index=4)
+    length_input = st.number_input("Période RSI", min_value=1, max_value=100, value=14)
+    smoothing = st.number_input("Lissage (Moyenne Mobile)", min_value=1, max_value=10, value=3)
+    lookback = st.slider("Nombre de bougies affichées", 30, 500, 100)
+
+# ==========================================
+# FONCTIONS DE CALCUL
+# ==========================================
+
+def calculate_rsi(series, period):
+    """Calcule le RSI manuellement sur une série Pandas"""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).fillna(0)
+    loss = (-delta.where(delta < 0, 0)).fillna(0)
+    
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_oanda_data(token, env, granular, count=500):
+    """Récupère les données des 28 paires majeures via l'API OANDA"""
+    
+    # Liste standard des paires OANDA (Format BASE_QUOTE)
+    pairs_list = [
+        "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "USD_CAD", "NZD_USD",
+        "EUR_GBP", "EUR_JPY", "EUR_CHF", "EUR_CAD", "EUR_AUD", "EUR_NZD",
+        "GBP_JPY", "GBP_CHF", "GBP_CAD", "GBP_AUD", "GBP_NZD",
+        "AUD_JPY", "AUD_CAD", "AUD_CHF", "AUD_NZD",
+        "CAD_JPY", "CAD_CHF", "NZD_JPY", "NZD_CAD", "NZD_CHF", "CHF_JPY"
+    ]
+    
+    try:
+        client = API(access_token=token, environment=env)
+    except Exception as e:
+        return None, f"Erreur de connexion API : {str(e)}"
+
+    df_dict = {}
+    params = {"count": count + 50, "granularity": granular, "price": "M"} # M = Mid price
+
+    # Barre de progression
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for idx, pair in enumerate(pairs_list):
+        status_text.text(f"Récupération {pair}...")
+        try:
+            r = instruments.InstrumentsCandles(instrument=pair, params=params)
+            client.request(r)
             
-            avgGain = ta.rma(gain, lengthInput)
-            avgLoss = ta.rma(loss, lengthInput)
+            # Extraction des données : Time et Close
+            candles = r.response['candles']
+            data = []
+            for candle in candles:
+                if candle['complete']:
+                    data.append({
+                        "Time": candle['time'],
+                        pair: float(candle['mid']['c'])
+                    })
             
-            rs = avgLoss == 0 ? 100.0 : avgGain / avgLoss
-            rsi = 100 - (100 / (1 + rs))
+            temp_df = pd.DataFrame(data)
+            temp_df['Time'] = pd.to_datetime(temp_df['Time'])
+            temp_df.set_index('Time', inplace=True)
             
-            // Ajouter à la force (RSI > 50 = devise forte)
-            strength += (rsi - 50) / 50  // Normaliser entre -1 et 1
-            validPairs += 1
-    
-    // Moyenne et normalisation 0-10
-    avgStrength = validPairs > 0 ? strength / validPairs : 0.0
-    normalized = (avgStrength + 1) * 5  // Convertir -1/1 vers 0-10
-    
-    // Appliquer le lissage
-    ta.sma(normalized, smoothing)
-
-// ==========================================
-// CALCUL DES FORCES
-// ==========================================
-usdStrength = calcCurrencyStrength("USD")
-eurStrength = calcCurrencyStrength("EUR")
-gbpStrength = calcCurrencyStrength("GBP")
-jpyStrength = calcCurrencyStrength("JPY")
-audStrength = calcCurrencyStrength("AUD")
-cadStrength = calcCurrencyStrength("CAD")
-nzdStrength = calcCurrencyStrength("NZD")
-chfStrength = calcCurrencyStrength("CHF")
-
-// ==========================================
-// AFFICHAGE GRAPHIQUE
-// ==========================================
-plot(usdStrength, "USD", color=color.new(#2962FF, 0), linewidth=2)
-plot(eurStrength, "EUR", color=color.new(#00E676, 0), linewidth=2)
-plot(gbpStrength, "GBP", color=color.new(#FF6D00, 0), linewidth=2)
-plot(jpyStrength, "JPY", color=color.new(#AA00FF, 0), linewidth=2)
-plot(audStrength, "AUD", color=color.new(#00B0FF, 0), linewidth=2)
-plot(cadStrength, "CAD", color=color.new(#FF1744, 0), linewidth=2)
-plot(nzdStrength, "NZD", color=color.new(#FFEA00, 0), linewidth=2)
-plot(chfStrength, "CHF", color=color.new(#00C853, 0), linewidth=2)
-
-// Ligne médiane
-hline(5, "Neutre", color=color.gray, linestyle=hline.style_dashed)
-hline(7, "Fort", color=color.green, linestyle=hline.style_dotted)
-hline(3, "Faible", color=color.red, linestyle=hline.style_dotted)
-
-// ==========================================
-// TABLEAU DE CLASSEMENT
-// ==========================================
-if showTable and barstate.islast
-    // Créer les données pour le tri
-    var currencies = array.from("USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF")
-    var strengths = array.from(usdStrength, eurStrength, gbpStrength, jpyStrength, 
-        audStrength, cadStrength, nzdStrength, chfStrength)
-    
-    // Trier par force décroissante (bubble sort)
-    size = array.size(currencies)
-    for i = 0 to size - 2
-        for j = 0 to size - 2 - i
-            if array.get(strengths, j) < array.get(strengths, j + 1)
-                // Échanger
-                tempStr = array.get(strengths, j)
-                tempCur = array.get(currencies, j)
-                array.set(strengths, j, array.get(strengths, j + 1))
-                array.set(currencies, j, array.get(currencies, j + 1))
-                array.set(strengths, j + 1, tempStr)
-                array.set(currencies, j + 1, tempCur)
-    
-    // Créer le tableau
-    var table tbl = table.new(tablePosition, 3, 9, 
-        bgcolor=color.new(#000000, 10), frame_color=color.new(#3B82F6, 0), frame_width=2)
-    
-    // En-tête
-    table.cell(tbl, 0, 0, "Rang", bgcolor=color.new(#1E3A8A, 0), text_color=color.white, 
-        text_size=size.small, text_font_family=font.family_monospace)
-    table.cell(tbl, 1, 0, "Devise", bgcolor=color.new(#1E3A8A, 0), text_color=color.white, 
-        text_size=size.small, text_font_family=font.family_monospace)
-    table.cell(tbl, 2, 0, "Force", bgcolor=color.new(#1E3A8A, 0), text_color=color.white, 
-        text_size=size.small, text_font_family=font.family_monospace)
-    
-    // Remplir le tableau
-    for i = 0 to size - 1
-        curr = array.get(currencies, i)
-        str = array.get(strengths, i)
+            # Fusionner dans le dictionnaire global
+            df_dict[pair] = temp_df[pair]
+            
+        except Exception as e:
+            # Si une paire échoue, on continue (certains comptes n'ont pas toutes les paires)
+            print(f"Erreur sur {pair}: {e}")
         
-        // Couleur selon la force
-        bgColor = str >= 7 ? color.new(#10B981, 80) : 
-                  str >= 5.5 ? color.new(#3B82F6, 80) : 
-                  str >= 4 ? color.new(#F59E0B, 80) : 
-                  color.new(#EF4444, 80)
+        progress_bar.progress((idx + 1) / len(pairs_list))
+    
+    status_text.empty()
+    progress_bar.empty()
+
+    if not df_dict:
+        return None, "Aucune donnée récupérée. Vérifiez votre Token et vos permissions."
+
+    # Création du DataFrame global synchronisé
+    full_df = pd.DataFrame(df_dict)
+    full_df = full_df.fillna(method='ffill').fillna(method='bfill') # Gérer les trous de cotation
+    return full_df, None
+
+def calculate_strength(df, length, smooth):
+    """Calcule la force relative de chaque devise"""
+    currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
+    strength_df = pd.DataFrame(index=df.index)
+    
+    for curr in currencies:
+        total_strength = pd.Series(0.0, index=df.index)
+        valid_pairs = 0
         
-        // Icône
-        icon = str >= 7 ? "🟢" : str >= 5.5 ? "🔵" : str >= 4 ? "🟡" : "🔴"
+        opponents = [c for c in currencies if c != curr]
         
-        table.cell(tbl, 0, i + 1, str.tostring("#" + str(i + 1)), 
-            bgcolor=bgColor, text_color=color.white, text_size=size.small)
-        table.cell(tbl, 1, i + 1, icon + " " + curr, 
-            bgcolor=bgColor, text_color=color.white, text_size=size.normal, 
-            text_font_family=font.family_monospace)
-        table.cell(tbl, 2, i + 1, str.tostring("0.0") + "/10", 
-            bgcolor=bgColor, text_color=color.white, text_size=size.small)
+        for opp in opponents:
+            # Construction des noms de paires possibles selon la convention OANDA
+            # OANDA a des paires fixes (ex: EUR_USD existe, USD_EUR n'existe pas)
+            pair_direct = f"{curr}_{opp}"
+            pair_inverse = f"{opp}_{curr}"
+            
+            rsi_series = None
+            
+            if pair_direct in df.columns:
+                # La paire existe (ex: on veut EUR, et EUR_USD est dispo)
+                price = df[pair_direct]
+                rsi_series = calculate_rsi(price, length)
+                
+            elif pair_inverse in df.columns:
+                # La paire est inversée (ex: on veut USD, mais seul EUR_USD existe)
+                # Astuce mathématique : RSI de (1/Prix) = RSI inversé
+                price = df[pair_inverse]
+                rsi_series = calculate_rsi(1/price, length)
+            
+            if rsi_series is not None:
+                # Normalisation (-1 à 1)
+                norm = (rsi_series - 50) / 50
+                total_strength += norm
+                valid_pairs += 1
+        
+        if valid_pairs > 0:
+            avg_strength = total_strength / valid_pairs
+            # Conversion vers 0-10
+            final_val = (avg_strength + 1) * 5
+            # Lissage
+            strength_df[curr] = final_val.rolling(window=smooth).mean()
+            
+    return strength_df.dropna()
 
-// ==========================================
-// ALERTES
-// ==========================================
-// Alerte devise très forte
-alertcondition(usdStrength > 8 or eurStrength > 8 or gbpStrength > 8 or jpyStrength > 8 or 
-    audStrength > 8 or cadStrength > 8 or nzdStrength > 8 or chfStrength > 8, 
-    title="Devise Très Forte", 
-    message="Une devise a dépassé 8.0/10")
+# ==========================================
+# EXÉCUTION PRINCIPALE
+# ==========================================
 
-// Alerte devise très faible
-alertcondition(usdStrength < 2 or eurStrength < 2 or gbpStrength < 2 or jpyStrength < 2 or 
-    audStrength < 2 or cadStrength < 2 or nzdStrength < 2 or chfStrength < 2, 
-    title="Devise Très Faible", 
-    message="Une devise est tombée sous 2.0/10")
+if not access_token:
+    st.warning("👈 Veuillez entrer votre Token API OANDA dans la barre latérale pour commencer.")
+    st.info("Vous pouvez obtenir un token 'Practice' dans votre compte OANDA : Manage API Access.")
 
-// Alerte divergence forte
-divergence = math.max(usdStrength, eurStrength, gbpStrength, jpyStrength, audStrength, cadStrength, nzdStrength, chfStrength) - 
-             math.min(usdStrength, eurStrength, gbpStrength, jpyStrength, audStrength, cadStrength, nzdStrength, chfStrength)
+else:
+    # 1. Récupération des données
+    df_prices, error_msg = fetch_oanda_data(access_token, environment, granularity, count=lookback+100)
+    
+    if error_msg:
+        st.error(error_msg)
+    elif df_prices is not None:
+        
+        # 2. Calcul des forces
+        df_strength = calculate_strength(df_prices, length_input, smoothing)
+        
+        # Filtrage pour affichage
+        df_display = df_strength.tail(lookback)
+        
+        # 3. GRAPHIQUE
+        fig = go.Figure()
+        for col in df_display.columns:
+            fig.add_trace(go.Scatter(
+                x=df_display.index, 
+                y=df_display[col], 
+                mode='lines', 
+                name=col,
+                line=dict(color=COLORS[col], width=2)
+            ))
 
-alertcondition(divergence > 6, 
-    title="Divergence Extrême", 
-    message="Écart de force > 6.0 entre devises")
+        # Niveaux
+        fig.add_hline(y=5, line_dash="dash", line_color="gray", annotation_text="Neutre")
+        fig.add_hline(y=7, line_dash="dot", line_color="green", annotation_text="Fort")
+        fig.add_hline(y=3, line_dash="dot", line_color="red", annotation_text="Faible")
+
+        fig.update_layout(
+            title=f"Currency Strength Meter ({granularity})",
+            xaxis_title="Temps",
+            yaxis_title="Force (0-10)",
+            template="plotly_dark",
+            height=600,
+            yaxis=dict(range=[0, 10]),
+            margin=dict(l=20, r=20, t=50, b=20)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # 4. TABLEAU DE CLASSEMENT
+        st.subheader("Classement en temps réel")
+        
+        # Dernière valeur disponible
+        last_values = df_display.iloc[-1].sort_values(ascending=False)
+        
+        rank_df = pd.DataFrame({
+            "Devise": last_values.index,
+            "Force": last_values.values
+        })
+        rank_df["Rang"] = range(1, len(rank_df) + 1)
+        rank_df = rank_df[["Rang", "Devise", "Force"]]
+
+        # Style conditionnel
+        def color_strength(val):
+            if isinstance(val, (int, float)):
+                if val >= 7: return 'background-color: rgba(16, 185, 129, 0.8); color: white;' 
+                if val >= 5.5: return 'background-color: rgba(59, 130, 246, 0.8); color: white;' 
+                if val >= 4: return 'background-color: rgba(245, 158, 11, 0.8); color: white;' 
+                return 'background-color: rgba(239, 68, 68, 0.8); color: white;' 
+            return ''
+
+        st.dataframe(
+            rank_df.style.applymap(color_strength, subset=['Force'])
+            .format({"Force": "{:.2f}/10"}),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # 5. ALERTES
+        st.subheader("⚠️ Alertes Détectées")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            for curr, val in last_values.items():
+                if val > 8:
+                    st.success(f"🚀 **{curr}** est en surachat extrême (> 8.0)")
+                elif val < 2:
+                    st.error(f"🩸 **{curr}** est en survente extrême (< 2.0)")
+
+        with col2:
+            max_s = last_values.max()
+            min_s = last_values.min()
+            divergence = max_s - min_s
+            if divergence > 6:
+                st.warning(f"⚡ **Divergence massive ({divergence:.2f})** entre {last_values.index[0]} et {last_values.index[-1]}")
+            else:
+                st.info("Aucune divergence majeure détectée.")
