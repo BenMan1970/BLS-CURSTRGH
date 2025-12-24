@@ -19,10 +19,11 @@ st.markdown("---")
 
 # Récupération des secrets
 try:
-    OANDA_API_KEY = st.secrets["OANDA_API_KEY"]
+    OANDA_ACCOUNT_ID = st.secrets["OANDA_ACCOUNT_ID"]
+    OANDA_ACCESS_TOKEN = st.secrets["OANDA_ACCESS_TOKEN"]
     OANDA_ACCOUNT_TYPE = st.secrets.get("OANDA_ACCOUNT_TYPE", "practice")
 except:
-    st.error("⚠️ Clé API Oanda manquante. Configurez OANDA_API_KEY dans les secrets Streamlit.")
+    st.error("⚠️ Identifiants Oanda manquants. Configurez OANDA_ACCOUNT_ID et OANDA_ACCESS_TOKEN dans les secrets Streamlit.")
     st.stop()
 
 # URL de l'API Oanda
@@ -48,7 +49,7 @@ CURRENCY_COLORS = {
 def get_oanda_data(instrument, granularity='M1', count=1440):
     """Récupère les données historiques depuis Oanda"""
     headers = {
-        'Authorization': f'Bearer {OANDA_API_KEY}',
+        'Authorization': f'Bearer {OANDA_ACCESS_TOKEN}',
         'Content-Type': 'application/json'
     }
     
