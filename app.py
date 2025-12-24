@@ -2,16 +2,17 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import oandapyV20
 from oandapyV20 import API
 import oandapyV20.endpoints.instruments as instruments
 
 # ==========================================
-# CONFIGURATION ET STYLE CSS (DESIGN RÉPLIQUE)
+# 1. CONFIGURATION ET STYLE CSS (DESIGN RÉPLIQUE)
 # ==========================================
 st.set_page_config(page_title="Bluestar Currency Strength", layout="wide")
 
-# Injection CSS pour imiter currencystrengthmeter.org
+# Injection CSS pour le design des cartes et du fond
 st.markdown("""
 <style>
     /* Fond global sombre */
@@ -22,17 +23,17 @@ st.markdown("""
     /* Style des cartes de devises */
     .currency-card {
         background-color: #1f2937;
-        border-radius: 10px;
-        padding: 15px;
+        border-radius: 12px;
+        padding: 20px;
         margin-bottom: 15px;
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
         border: 1px solid #374151;
-        transition: transform 0.2s;
         text-align: center;
+        transition: transform 0.2s;
     }
     .currency-card:hover {
+        border-color: #6b7280;
         transform: translateY(-2px);
-        border-color: #4b5563;
     }
     
     /* En-tête de la carte (Drapeau + Code) */
@@ -40,53 +41,55 @@ st.markdown("""
         display: flex;
         justify-content: center;
         align-items: center;
-        gap: 10px;
-        margin-bottom: 10px;
-        font-size: 1.2rem;
-        font-weight: bold;
+        gap: 12px;
+        margin-bottom: 8px;
+        font-size: 1.4rem;
+        font-weight: 700;
         color: white;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
     }
     
     /* Images drapeaux */
     .flag-img {
-        width: 28px;
-        height: 20px;
-        border-radius: 2px;
-        object-fit: cover;
+        width: 32px;
+        height: 24px;
+        border-radius: 3px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.5);
     }
     
     /* Score central */
     .strength-score {
-        font-size: 2.2rem;
+        font-size: 2.5rem;
         font-weight: 800;
         margin: 5px 0;
+        letter-spacing: -1px;
     }
     
     /* Flèche de tendance */
     .trend-arrow {
-        font-size: 1.2rem;
+        font-size: 1.5rem;
         vertical-align: middle;
-        margin-left: 5px;
+        margin-left: 8px;
     }
     
     /* Barre de progression container */
     .progress-bg {
         background-color: #374151;
-        height: 8px;
-        border-radius: 4px;
+        height: 6px;
+        border-radius: 3px;
         width: 100%;
-        margin-top: 10px;
+        margin-top: 15px;
         overflow: hidden;
     }
     
     /* Barre de progression remplissage */
     .progress-fill {
         height: 100%;
-        border-radius: 4px;
-        transition: width 0.5s ease-in-out;
+        border-radius: 3px;
+        transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
     }
     
-    /* Couleurs dynamiques */
+    /* Classes de couleurs dynamiques */
     .text-green { color: #10B981; }
     .text-blue { color: #3B82F6; }
     .text-orange { color: #F59E0B; }
@@ -97,53 +100,50 @@ st.markdown("""
     .bg-orange { background-color: #F59E0B; }
     .bg-red { background-color: #EF4444; }
 
-    /* Cacher le menu hamburger pour un look plus "site web" */
+    /* Nettoyage interface Streamlit */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+    header {visibility: hidden;}
     
 </style>
 """, unsafe_allow_html=True)
 
-# Mapping des drapeaux (Codes ISO pays pour flagcdn)
+# Mapping des drapeaux
 FLAG_URLS = {
     "USD": "us", "EUR": "eu", "GBP": "gb", "JPY": "jp",
     "AUD": "au", "CAD": "ca", "NZD": "nz", "CHF": "ch"
-}
-
-# Couleurs pour le graphique
-CHART_COLORS = {
-    "USD": "#2962FF", "EUR": "#00E676", "GBP": "#FF6D00", "JPY": "#AA00FF",
-    "AUD": "#00B0FF", "CAD": "#FF1744", "NZD": "#FFEA00", "CHF": "#00C853"
 }
 
 st.title("💎 Bluestar Currency Strength Meter")
 st.markdown("---")
 
 # ==========================================
-# GESTION DES SECRETS & SIDEBAR
+# 2. GESTION DES SECRETS & BARRE LATÉRALE
 # ==========================================
 with st.sidebar:
     st.header("Configuration")
     
-    # Secrets
+    # Récupération automatique des secrets
     secret_token = st.secrets.get("OANDA_ACCESS_TOKEN", None)
     
     if secret_token:
+        st.success("✅ Connecté (Secrets)")
         access_token = secret_token
     else:
-        st.info("Mode manuel")
-        access_token = st.text_input("OANDA Token", type="password")
+        st.info("Mode Manuel")
+        access_token = st.text_input("Token OANDA", type="password")
 
-    environment = st.selectbox("Environnement", ["practice", "live"], index=0)
+    environment = st.selectbox("Environnement", ["practice", "live"], index=0, help="Practice=Demo, Live=Réel")
     
     st.markdown("---")
+    st.caption("Paramètres de calcul")
     granularity = st.selectbox("Timeframe", ["M15", "M30", "H1", "H4", "D", "W"], index=4)
-    length_input = st.number_input("Période RSI", value=14)
-    smoothing = st.number_input("Lissage", value=3)
-    lookback = st.slider("Historique Graphique", 50, 500, 100)
+    length_input = st.number_input("Période RSI", value=14, min_value=1)
+    smoothing = st.number_input("Lissage", value=3, min_value=1)
+    lookback = st.slider("Historique (Bougies)", 50, 500, 100)
 
 # ==========================================
-# FONCTIONS BACKEND (IDENTIQUES)
+# 3. FONCTIONS DE CALCUL (BACKEND)
 # ==========================================
 
 def calculate_rsi(series, period):
@@ -156,7 +156,7 @@ def calculate_rsi(series, period):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-@st.cache_data(ttl=60, show_spinner=False) # Cache court (1 min) pour réactivité
+@st.cache_data(ttl=60, show_spinner=False) 
 def fetch_oanda_data(token, env, granular, count):
     pairs_list = [
         "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD", "USD_CAD", "NZD_USD",
@@ -169,12 +169,11 @@ def fetch_oanda_data(token, env, granular, count):
     try:
         client = API(access_token=token, environment=env)
     except Exception as e:
-        return None, f"Erreur API: {str(e)}"
+        return None, f"Erreur Client API: {str(e)}"
 
     df_dict = {}
     params = {"count": count + 50, "granularity": granular, "price": "M"}
 
-    # Pas de barre de progression visible pour garder le look propre
     try:
         for pair in pairs_list:
             r = instruments.InstrumentsCandles(instrument=pair, params=params)
@@ -189,10 +188,11 @@ def fetch_oanda_data(token, env, granular, count):
             temp_df['Time'] = pd.to_datetime(temp_df['Time'])
             temp_df.set_index('Time', inplace=True)
             df_dict[pair] = temp_df[pair]
-    except Exception:
+    except Exception as e:
+        # On continue même si une paire échoue (ex: compte restreint)
         pass 
 
-    if not df_dict: return None, "Erreur de données"
+    if not df_dict: return None, "Aucune donnée reçue. Vérifiez le token et le type de compte."
     
     full_df = pd.DataFrame(df_dict)
     full_df = full_df.fillna(method='ffill').fillna(method='bfill')
@@ -223,47 +223,35 @@ def calculate_strength(df, length, smooth):
         
         if valid_pairs > 0:
             avg_strength = total_strength / valid_pairs
-            # Conversion 0-10 et Lissage
             strength_df[curr] = ((avg_strength + 1) * 5).rolling(window=smooth).mean()
             
     return strength_df.dropna()
 
 # ==========================================
-# FONCTION D'AFFICHAGE HTML (CARD)
+# 4. COMPOSANT VISUEL (CARTE HTML)
 # ==========================================
 def display_currency_card(curr, value, prev_value):
-    # Calcul de la tendance
     change = value - prev_value
     
-    # Détermination des couleurs et icônes
+    # Logique de couleur stricte
     if value >= 7:
-        color_class = "text-green"
-        bg_class = "bg-green"
+        color_class, bg_class = "text-green", "bg-green"
     elif value >= 5.5:
-        color_class = "text-blue"
-        bg_class = "bg-blue"
+        color_class, bg_class = "text-blue", "bg-blue"
     elif value >= 4:
-        color_class = "text-orange"
-        bg_class = "bg-orange"
+        color_class, bg_class = "text-orange", "bg-orange"
     else:
-        color_class = "text-red"
-        bg_class = "bg-red"
+        color_class, bg_class = "text-red", "bg-red"
 
-    # Flèche
+    # Logique de flèche
     if change > 0.05:
-        arrow = "▲"
-        arrow_color = "text-green"
+        arrow, arrow_color = "▲", "text-green"
     elif change < -0.05:
-        arrow = "▼"
-        arrow_color = "text-red"
+        arrow, arrow_color = "▼", "text-red"
     else:
-        arrow = "▶"
-        arrow_color = "text-gray"
+        arrow, arrow_color = "▶", "text-gray"
 
-    flag_code = FLAG_URLS.get(curr, "unknown")
-    flag_url = f"https://flagcdn.com/48x36/{flag_code}.png"
-    
-    # Largeur de la barre (x10 car valeur sur 10)
+    flag_url = f"https://flagcdn.com/48x36/{FLAG_URLS.get(curr, 'unknown')}.png"
     bar_width = min(max(value * 10, 0), 100)
 
     html = f"""
@@ -284,30 +272,28 @@ def display_currency_card(curr, value, prev_value):
     return html
 
 # ==========================================
-# EXÉCUTION PRINCIPALE
+# 5. EXÉCUTION PRINCIPALE
 # ==========================================
 
 if not access_token:
-    st.warning("⚠️ Token manquant")
+    st.warning("⚠️ Veuillez configurer votre Token OANDA dans la sidebar ou les secrets.")
 else:
-    with st.spinner('Analyse du marché en cours...'):
+    with st.spinner('Connexion aux marchés OANDA...'):
         df_prices, error = fetch_oanda_data(access_token, environment, granularity, lookback)
     
-    if df_prices is not None:
+    if error:
+        st.error(error)
+    elif df_prices is not None:
+        # Calculs
         df_strength = calculate_strength(df_prices, length_input, smoothing)
         
-        # Récupération des deux dernières valeurs pour la tendance
         latest = df_strength.iloc[-1]
         previous = df_strength.iloc[-2]
         
-        # Tri par force (Le plus fort en premier, comme sur le site de ref)
+        # Tri : Forts en premier
         sorted_currencies = latest.sort_values(ascending=False).index.tolist()
         
-        # ==========================================
-        # 1. GRILLE DE CARTES (METER)
-        # ==========================================
-        
-        # On sépare en 2 rangées de 4 colonnes
+        # --- SECTION 1 : JAUGES (CARDS) ---
         row1 = sorted_currencies[:4]
         row2 = sorted_currencies[4:]
         
@@ -321,42 +307,67 @@ else:
             with cols2[i]:
                 st.markdown(display_currency_card(curr, latest[curr], previous[curr]), unsafe_allow_html=True)
 
-        # ==========================================
-        # 2. GRAPHIQUE HISTORIQUE
-        # ==========================================
-        st.write("") # Spacer
+        # --- SECTION 2 : GRAPHIQUES "SMALL MULTIPLES" (Séparés) ---
         st.write("")
-        st.subheader("Historique de tendance")
+        st.write("")
+        st.subheader("Tendances Individuelles")
         
+        # Filtrer pour l'affichage
         df_display = df_strength.tail(lookback)
         
-        fig = go.Figure()
-        for col in df_display.columns:
-            # Opacité réduite pour les lignes non survolées (optionnel, ici tout visible)
-            fig.add_trace(go.Scatter(
-                x=df_display.index, 
-                y=df_display[col], 
-                mode='lines', 
-                name=col,
-                line=dict(color=CHART_COLORS[col], width=2)
-            ))
-
-        fig.add_hline(y=5, line_dash="dash", line_color="gray", opacity=0.5)
-        fig.add_hline(y=7, line_dash="dot", line_color="green", opacity=0.5)
-        fig.add_hline(y=3, line_dash="dot", line_color="red", opacity=0.5)
-
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor='rgba(0,0,0,0)', # Transparent pour fondre avec le fond CSS
-            plot_bgcolor='rgba(0,0,0,0)',
-            height=500,
-            yaxis=dict(range=[0, 10], gridcolor='#374151'),
-            xaxis=dict(gridcolor='#374151'),
-            margin=dict(l=10, r=10, t=30, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        # Création de la grille 2x4
+        fig = make_subplots(
+            rows=2, cols=4, 
+            subplot_titles=sorted_currencies, # Titres dans l'ordre de force
+            vertical_spacing=0.15,
+            horizontal_spacing=0.05
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        for idx, curr in enumerate(sorted_currencies):
+            # Calcul position grille (1-4, 5-8)
+            row = (idx // 4) + 1
+            col = (idx % 4) + 1
+            
+            # Couleur dynamique du graphique
+            val = latest[curr]
+            if val >= 5.5: line_col = "#10B981" # Vert
+            elif val <= 4.5: line_col = "#EF4444" # Rouge
+            else: line_col = "#3B82F6" # Bleu
+            
+            # Création de la couleur de remplissage (transparente)
+            # Conversion Hex -> RGB
+            hex_col = line_col.lstrip('#')
+            rgb = tuple(int(hex_col[i:i+2], 16) for i in (0, 2, 4))
+            fill_col = f"rgba({rgb[0]},{rgb[1]},{rgb[2]},0.2)"
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=df_display.index, 
+                    y=df_display[curr],
+                    mode='lines',
+                    line=dict(color=line_col, width=2),
+                    fill='tozeroy',
+                    fillcolor=fill_col,
+                    hoverinfo='y+x'
+                ),
+                row=row, col=col
+            )
 
-    elif error:
-        st.error(error)
+        # Mise en page propre sans quadrillage
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            height=450,
+            showlegend=False,
+            margin=dict(l=10, r=10, t=40, b=10)
+        )
+        
+        # Nettoyage des axes
+        fig.update_yaxes(range=[0, 10], showgrid=False, zeroline=False, tickfont=dict(size=8), showticklabels=False)
+        fig.update_xaxes(showgrid=False, showticklabels=False)
+        
+        # Ajout de lignes guides discrètes (5.0)
+        fig.add_hline(y=5, line_dash="dot", line_color="gray", opacity=0.3, line_width=1)
+
+        st.plotly_chart(fig, use_container_width=True)
