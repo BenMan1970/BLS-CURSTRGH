@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 import logging
+import html
 import hashlib
-import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -12,9 +12,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from oandapyV20 import API
-import oandapyV20.endpoints.instruments as instruments
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from oandapyV20.endpoints import instruments
+
 
 # ==========================================
 # ── CONSTANTS ─────────────────────────────
@@ -40,13 +39,9 @@ TIMEFRAMES_MTF: Dict[str, dict] = {
 MIN_STRENGTH_DIFF: float = 1.5
 ATR_MIN_PERCENTILE: int  = 25
 MAX_PAIRS: int           = 3
-MAX_CURRENCY_EXPOSURE    = 1      # Une seule paire par devise forte
-
-# Seuil de spread en‑dessous duquel on ne crée pas d’extrêmes artificiels
-MIN_RAW_SPREAD = 0.15
-
-# Timeout HTTP (secondes)
-HTTP_TIMEOUT = 8.0
+MAX_CURRENCY_EXPOSURE    = 1
+MIN_RAW_SPREAD: float    = 0.15
+HTTP_TIMEOUT: float      = 8.0
 
 logger = logging.getLogger(__name__)
 
@@ -55,17 +50,20 @@ logger = logging.getLogger(__name__)
 # ── OUTILS RÉSEAU & VALIDATION ────────────
 # ==========================================
 
-def _create_client(token: str, env: str) -> API:
-    """Crée un client OANDA avec timeout et retry."""
-    session = API(access_token=token, environment=env)
-    # Monkey‑patch pour timeout
+def _create_client(access_token: str, environment: str) -> API:
+    """Crée un client OANDA avec timeout."""
+    session = API(access_token=access_token, environment=environment)
     original_request = session.request
+
     def patched_request(endpoint, timeout=HTTP_TIMEOUT):
         return original_request(endpoint, timeout=timeout)
+
     session.request = patched_request
     return session
 
+
 def validate_ohlcv(df: pd.DataFrame, min_len: int = 20) -> None:
+    """Valide la structure et le contenu d'un DataFrame OHLCV."""
     required = {"Open", "High", "Low", "Close"}
     missing = required - set(df.columns)
     if missing:
@@ -78,8 +76,10 @@ def validate_ohlcv(df: pd.DataFrame, min_len: int = 20) -> None:
     if len(df) < min_len:
         raise ValueError(f"Longueur insuffisante: {len(df)} < {min_len}")
 
-def token_fingerprint(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+def token_fingerprint(access_token: str) -> str:
+    """Empreinte non réversible du token pour isolation des caches."""
+    return hashlib.sha256(access_token.encode()).hexdigest()[:16]
 
 
 # ==========================================
@@ -88,6 +88,7 @@ def token_fingerprint(token: str) -> str:
 
 @dataclass
 class StrengthResult:
+    """Résultat complet du calcul de force des devises."""
     scores:         Dict[str, float] = field(default_factory=dict)
     scores_display: Dict[str, float] = field(default_factory=dict)
     ranking:        List[str]        = field(default_factory=list)
@@ -95,12 +96,12 @@ class StrengthResult:
     best_pairs:     List[str]        = field(default_factory=list)
     pairs_detail:   List[Dict]       = field(default_factory=list)
     pairs_fetched:  int              = 0
-    # Nouvelles métadonnées de confiance
     coverage:       Dict[str, float] = field(default_factory=dict)
     warnings:       List[str]        = field(default_factory=list)
     valid:          bool             = True
 
     def to_dict(self) -> dict:
+        """Exporte le résultat sous forme de dictionnaire."""
         return {
             "scores":         self.scores,
             "scores_display": self.scores_display,
@@ -115,35 +116,49 @@ class StrengthResult:
         }
 
     def direction_arrow(self, currency: str) -> str:
+        """Retourne la flèche directionnelle pour une devise."""
         v = self.velocity.get(currency, 0.0)
-        if v > 0.02:  return "up"
-        if v < -0.02: return "down"
+        if v > 0.02:
+            return "up"
+        if v < -0.02:
+            return "down"
         return "flat"
 
     def color_class(self, currency: str) -> str:
+        """Retourne la classe CSS pour une devise."""
         s = self.scores_display.get(currency, 5.0)
-        if s >= 7.0: return "strong-bull"
-        if s >= 5.5: return "mild-bull"
-        if s >= 4.0: return "mild-bear"
+        if s >= 7.0:
+            return "strong-bull"
+        if s >= 5.5:
+            return "mild-bull"
+        if s >= 4.0:
+            return "mild-bear"
         return "strong-bear"
 
 
 # ── Fonctions techniques pures ────────────────────────────────────────────────
 
 def _ema(series: pd.Series, span: int) -> pd.Series:
+    """Moyenne mobile exponentielle."""
     return series.ewm(span=span, adjust=False).mean()
 
+
 def _sma(series: pd.Series, window: int) -> pd.Series:
+    """Moyenne mobile simple."""
     return series.rolling(window=window).mean()
 
+
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Relative Strength Index."""
     delta = close.diff()
     gain  = delta.where(delta > 0, 0.0).rolling(window=period).mean()
     loss  = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
     rs    = gain / loss
     return 100 - (100 / (1 + rs))
 
+
 def _atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average True Range (série complète)."""
     tr = pd.concat([
         df["High"] - df["Low"],
         (df["High"] - df["Close"].shift(1)).abs(),
@@ -151,7 +166,9 @@ def _atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.ewm(span=period, adjust=False).mean()
 
+
 def _dmi(df: pd.DataFrame, period: int = 14) -> Tuple[Optional[float], Optional[float]]:
+    """Directional Movement Index (pdi, mdi)."""
     high, low, close = df["High"], df["Low"], df["Close"]
     tr = pd.concat([
         high - low,
@@ -175,7 +192,8 @@ def _dmi(df: pd.DataFrame, period: int = 14) -> Tuple[Optional[float], Optional[
 # ── Fonctions de tendance (GPS V2.2) ──────────────────────────────────────────
 
 def trend_weekly(df: pd.DataFrame) -> Tuple[str, int]:
-    if len(df) < 200:          # Exige 200 bougies (plus de fallback EMA100)
+    """Tendance weekly basée sur EMA50 / SMA200."""
+    if len(df) < 200:
         return "Range", 0
     close  = df["Close"]
     ema50  = _ema(close, 50)
@@ -184,12 +202,42 @@ def trend_weekly(df: pd.DataFrame) -> Tuple[str, int]:
     curr_sma200, prev_sma200 = sma200.iloc[-1], sma200.iloc[-2]
     crossed_bull = (prev_ema50 <= prev_sma200) and (curr_ema50 > curr_sma200)
     crossed_bear = (prev_ema50 >= prev_sma200) and (curr_ema50 < curr_sma200)
-    if curr_ema50 > curr_sma200: return "Bullish", 90 if crossed_bull else 75
-    if curr_ema50 < curr_sma200: return "Bearish", 90 if crossed_bear else 75
+    if curr_ema50 > curr_sma200:
+        return "Bullish", 90 if crossed_bull else 75
+    if curr_ema50 < curr_sma200:
+        return "Bearish", 90 if crossed_bear else 75
     return "Range", 40
 
 
+def _swing_points(series: pd.Series, wing: int = 5) -> Tuple[List[int], List[int]]:
+    """Détecte les points pivots (swing highs/lows)."""
+    arr = series.to_numpy()
+    n   = len(arr)
+    highs, lows = [], []
+    for idx in range(wing, n - wing):
+        seg = arr[idx - wing: idx + wing + 1]
+        if arr[idx] >= seg.max() and arr[idx] > arr[idx - 1]:
+            highs.append(idx)
+        if arr[idx] <= seg.min() and arr[idx] < arr[idx - 1]:
+            lows.append(idx)
+    return highs, lows
+
+
+def _evaluate_weekly_open(df: pd.DataFrame, current_price: float) -> int:
+    """Évalue la position par rapport à l'open hebdomadaire (lundi)."""
+    try:
+        times       = pd.to_datetime(df.index)
+        monday_rows = df[times.dayofweek == 0]
+        if not monday_rows.empty:
+            weekly_open = float(monday_rows["Open"].iloc[-1])
+            return 1 if current_price > weekly_open else -1
+    except Exception:
+        logger.debug("trend_daily: weekly_open indisponible", exc_info=True)
+    return 0
+
+
 def trend_daily(df: pd.DataFrame) -> Tuple[str, int]:
+    """Tendance daily multi-critères."""
     if len(df) < 60:
         return "Range", 0
     close = df["Close"]
@@ -198,62 +246,55 @@ def trend_daily(df: pd.DataFrame) -> Tuple[str, int]:
     cur   = float(close.iloc[-1])
     votes_bull = votes_bear = 0
 
-    def _swing_pts(series: pd.Series, wing: int = 5) -> Tuple[List[int], List[int]]:
-        arr = series.to_numpy()
-        n   = len(arr)
-        highs, lows = [], []
-        for i in range(wing, n - wing):
-            seg = arr[i - wing: i + wing + 1]
-            if arr[i] >= seg.max() and arr[i] > arr[i - 1]:
-                highs.append(i)
-            if arr[i] <= seg.min() and arr[i] < arr[i - 1]:
-                lows.append(i)
-        return highs, lows
-
-    sh_idx, _  = _swing_pts(high)
-    _,  sl_idx = _swing_pts(low)
+    sh_idx, _  = _swing_points(high)
+    _,  sl_idx = _swing_points(low)
     if len(sh_idx) >= 2 and len(sl_idx) >= 2:
         hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
         hl = low.iloc[sl_idx[-1]]  > low.iloc[sl_idx[-2]]
         lh = high.iloc[sh_idx[-1]] < high.iloc[sh_idx[-2]]
         ll = low.iloc[sl_idx[-1]]  < low.iloc[sl_idx[-2]]
-        if hh and hl:   votes_bull += 2
-        elif lh and ll: votes_bear += 2
+        if hh and hl:
+            votes_bull += 2
+        elif lh and ll:
+            votes_bear += 2
 
     ema21 = _ema(close, 21).iloc[-1]
     ema50 = _ema(close, 50).iloc[-1]
-    if   cur > ema21 > ema50: votes_bull += 1
-    elif cur < ema21 < ema50: votes_bear += 1
+    if cur > ema21 > ema50:
+        votes_bull += 1
+    elif cur < ema21 < ema50:
+        votes_bear += 1
 
-    # Weekly open = dernier lundi (dayofweek == 0)
-    try:
-        times       = pd.to_datetime(df.index)
-        monday_rows = df[times.dayofweek == 0]
-        if not monday_rows.empty:
-            weekly_open = float(monday_rows["Open"].iloc[-1])
-            if cur > weekly_open: votes_bull += 1
-            else:                 votes_bear += 1
-    except Exception:
-        logger.debug("trend_daily: weekly_open indisponible", exc_info=True)
+    votes_bull += 1 if _evaluate_weekly_open(df, cur) > 0 else 0
+    votes_bear += 1 if _evaluate_weekly_open(df, cur) < 0 else 0
 
     if len(df) >= 2:
         midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
-        if float(close.iloc[-2]) > midpoint: votes_bull += 1
-        else:                                votes_bear += 1
+        if float(close.iloc[-2]) > midpoint:
+            votes_bull += 1
+        else:
+            votes_bear += 1
 
     if len(df) >= 200:
         sma200_val = _sma(close, 200).iloc[-1]
-        if   cur > sma200_val: votes_bull += 1
-        elif cur < sma200_val: votes_bear += 1
+        if cur > sma200_val:
+            votes_bull += 1
+        elif cur < sma200_val:
+            votes_bear += 1
 
-    if   votes_bull >= 5: return "Bullish", 90
-    if   votes_bull >= 3: return "Bullish", 70
-    if   votes_bear >= 5: return "Bearish", 90
-    if   votes_bear >= 3: return "Bearish", 70
+    if votes_bull >= 5:
+        return "Bullish", 90
+    if votes_bull >= 3:
+        return "Bullish", 70
+    if votes_bear >= 5:
+        return "Bearish", 90
+    if votes_bear >= 3:
+        return "Bearish", 70
     return "Range", 35
 
 
 def trend_4h(df: pd.DataFrame) -> Tuple[str, int]:
+    """Tendance H4 avec DMI et daily open."""
     if len(df) < 60:
         return "Range", 0
     close = df["Close"]
@@ -267,7 +308,6 @@ def trend_4h(df: pd.DataFrame) -> Tuple[str, int]:
             score += 1
         elif pdi_val < mdi_val:
             score -= 1
-        # égalité : pas de vote
 
     try:
         idx        = pd.to_datetime(df.index)
@@ -279,16 +319,28 @@ def trend_4h(df: pd.DataFrame) -> Tuple[str, int]:
             score += 1 if cur > daily_open else -1
         else:
             logger.debug("trend_4h: today_mask vide pour %s", df.index[-1])
-    except Exception as e:
-        logger.debug("trend_4h daily_open error: %s", e)
+    except Exception as exc:
+        logger.debug("trend_4h daily_open error: %s", exc)
 
     abs_score = abs(score)
-    strength  = 90 if abs_score == 3 else 70 if abs_score >= 1 else 40
-    trend     = "Bullish" if score > 0 else "Bearish" if score < 0 else "Range"
+    if abs_score == 3:
+        strength = 90
+    elif abs_score >= 1:
+        strength = 70
+    else:
+        strength = 40
+
+    if score > 0:
+        trend = "Bullish"
+    elif score < 0:
+        trend = "Bearish"
+    else:
+        trend = "Range"
     return trend, strength
 
 
 def trend_h1(df: pd.DataFrame) -> Tuple[str, int]:
+    """Tendance H1 avec ZLEMA, EMA et momentum."""
     if len(df) < 50:
         return "Range", 0
     close      = df["Close"]
@@ -307,6 +359,7 @@ def trend_h1(df: pd.DataFrame) -> Tuple[str, int]:
     ema_bear   = (ema9.iloc[-1] < ema21.iloc[-1]) and (ema21.iloc[-1] < ema50.iloc[-1])
     mom_bull   = (rsi_val > 50) and (curr_macd > curr_sig)
     mom_bear   = (rsi_val < 50) and (curr_macd < curr_sig)
+
     if (cur > curr_zlema) and ema_bull and mom_bull:
         base_s = max(25, min(75, abs(cur - curr_zlema) / cur * 1000))
         return "Bullish", int(round(base_s))
@@ -346,16 +399,18 @@ class StrengthEngine:
         self.api       = client
         self.min_diff  = min_diff
         self.max_pairs = max_pairs
-        self._cache: Dict[tuple, pd.DataFrame] = {}   # clé = (pair, gran, count, price)
-        self.errors: List[str] = []                  # accumulateur d’erreurs fetch
+        self._cache: Dict[tuple, pd.DataFrame] = {}
+        self.errors: List[str] = []
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
-    def _fetch_ohlcv(self, pair: str, granularity: str, count: int) -> Optional[pd.DataFrame]:
-        # CRIT‑001 : clé complète avec count
+    def _fetch_ohlcv(
+        self, pair: str, granularity: str, count: int
+    ) -> Optional[pd.DataFrame]:
+        """Récupère les chandeliers OANDA avec cache complet."""
         key = (pair, granularity, count, "M")
         if key in self._cache:
-            return self._cache[key].copy(deep=False)   # copie défensive
+            return self._cache[key].copy(deep=False)
         try:
             params = {"count": count, "granularity": granularity, "price": "M"}
             r = instruments.InstrumentsCandles(instrument=pair, params=params)
@@ -375,15 +430,18 @@ class StrengthEngine:
             df = pd.DataFrame(rows)
             df["Time"] = pd.to_datetime(df["Time"])
             df.set_index("Time", inplace=True)
-            validate_ohlcv(df, min_len=20)        # MAJ‑024
+            validate_ohlcv(df, min_len=20)
             self._cache[key] = df
             return df
-        except Exception as e:
-            logger.exception("Fetch OHLCV failed %s %s %d: %s", pair, granularity, count, e)
-            self.errors.append(f"{pair}/{granularity}/{count}: {e}")
+        except Exception as exc:
+            logger.exception(
+                "Fetch OHLCV failed %s %s %d: %s", pair, granularity, count, exc
+            )
+            self.errors.append(f"{pair}/{granularity}/{count}: {exc}")
             return None
 
     def _get_tf_df(self, pair: str, tf: str) -> Optional[pd.DataFrame]:
+        """Récupère le DataFrame pour un timeframe donné."""
         cfg = TIMEFRAMES_MTF[tf]
         df  = self._fetch_ohlcv(pair, cfg["gran_fetch"], cfg["count"])
         if df is None:
@@ -401,6 +459,7 @@ class StrengthEngine:
     # ── Scores MTF ────────────────────────────────────────────────────────────
 
     def _compute_mtf_scores(self) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Calcule les scores bruts multi-timeframe."""
         total:      Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         weight_sum: Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         for pair in PAIRS:
@@ -411,14 +470,20 @@ class StrengthEngine:
                     continue
                 trend, strength = _TREND_FN[tf](df)
                 weight = cfg["weight"]
-                # CRIT‑004 : ajouter le poids même si Range
                 weight_sum[base]  += weight
                 weight_sum[quote] += weight
-                if   trend == "Bullish":          contrib = +weight * (strength / 100)
-                elif trend == "Bearish":          contrib = -weight * (strength / 100)
-                elif trend == "Retracement Bull": contrib = +weight * 0.15
-                elif trend == "Retracement Bear": contrib = -weight * 0.15
-                else:                             contrib = 0.0
+
+                if trend == "Bullish":
+                    contrib = +weight * (strength / 100)
+                elif trend == "Bearish":
+                    contrib = -weight * (strength / 100)
+                elif trend == "Retracement Bull":
+                    contrib = +weight * 0.15
+                elif trend == "Retracement Bear":
+                    contrib = -weight * 0.15
+                else:
+                    contrib = 0.0
+
                 total[base]  += contrib
                 total[quote] -= contrib
         return total, weight_sum
@@ -428,6 +493,7 @@ class StrengthEngine:
         total:      Dict[str, float],
         weight_sum: Dict[str, float],
     ) -> Dict[str, float]:
+        """Normalise les scores bruts par les poids."""
         scores = {}
         for c in CURRENCIES:
             if weight_sum.get(c, 0.0) > 0:
@@ -439,45 +505,47 @@ class StrengthEngine:
 
     @staticmethod
     def _to_display(scores: Dict[str, float]) -> Dict[str, float]:
+        """Convertit les scores bruts en échelle 0-10."""
         values = list(scores.values())
         s_min, s_max = min(values), max(values)
         spread = s_max - s_min
-        # CRIT‑003 : si le spread réel est infime, ne pas créer d’extrêmes artificiels
         if spread < MIN_RAW_SPREAD:
-            # On ramène tout vers 5.0 proportionnellement
-            return {c: round(5.0 + (v - (s_min + s_max)/2) * 2, 2) for c, v in scores.items()}
+            center = (s_min + s_max) / 2
+            return {c: round(5.0 + (v - center) * 2, 2) for c, v in scores.items()}
         return {c: round((v - s_min) / spread * 10, 2) for c, v in scores.items()}
 
     # ── Vélocité (H1 pure) ────────────────────────────────────────────────────
 
     def _compute_velocity(self) -> Dict[str, float]:
-        # CRIT‑005 + MAJ‑020 : vélocité basée sur deux fenêtres H1 fixes de 48 barres
+        """Calcule la vélocité sur deux fenêtres H1 de 48 barres."""
         total_now:  Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         total_prev: Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         weight_sum: Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         weight = TIMEFRAMES_MTF["H1"]["weight"]
         for pair in PAIRS:
             base, quote = pair.split("_")
-            df = self._fetch_ohlcv(pair, "H1", 300)   # assez pour 2×48
+            df = self._fetch_ohlcv(pair, "H1", 300)
             if df is None or len(df) < 96:
                 continue
-            # Fenêtre actuelle : dernières 48 barres
             df_now  = df.iloc[-48:]
-            # Fenêtre passée : 48 barres précédentes
             df_prev = df.iloc[-96:-48]
             trend_now, strength_now = trend_h1(df_now)
             trend_prev, strength_prev = trend_h1(df_prev)
+
             if trend_now != "Range":
-                contrib_now = weight * (strength_now / 100) * (1 if "Bull" in trend_now else -1)
+                contrib_now = weight * (strength_now / 100)
+                contrib_now *= 1 if "Bull" in trend_now else -1
                 total_now[base]  += contrib_now
                 total_now[quote] -= contrib_now
             if trend_prev != "Range":
-                contrib_prev = weight * (strength_prev / 100) * (1 if "Bull" in trend_prev else -1)
+                contrib_prev = weight * (strength_prev / 100)
+                contrib_prev *= 1 if "Bull" in trend_prev else -1
                 total_prev[base]  += contrib_prev
                 total_prev[quote] -= contrib_prev
+
             weight_sum[base]  += weight
             weight_sum[quote] += weight
-        # Normaliser séparément
+
         scores_now = self._normalize(total_now, weight_sum)
         scores_prev = self._normalize(total_prev, weight_sum)
         return {
@@ -490,6 +558,7 @@ class StrengthEngine:
     def _select_pairs(
         self, scores_display: Dict[str, float]
     ) -> Tuple[List[str], List[Dict]]:
+        """Sélectionne les meilleures paires selon les forces relatives."""
         sorted_s  = sorted(scores_display.items(), key=lambda x: x[1], reverse=True)
         strongest = [c for c, _ in sorted_s[:2]]
         weakest   = [c for c, _ in sorted_s[-2:]]
@@ -503,40 +572,46 @@ class StrengthEngine:
                     continue
                 pair_direct  = f"{base}_{quote}"
                 pair_inverse = f"{quote}_{base}"
-                pair_id = (
-                    pair_direct  if pair_direct  in PAIRS else
-                    pair_inverse if pair_inverse in PAIRS else None
-                )
+                pair_id = None
+                if pair_direct in PAIRS:
+                    pair_id = pair_direct
+                elif pair_inverse in PAIRS:
+                    pair_id = pair_inverse
                 if pair_id is None:
                     continue
-                df_h1   = self._fetch_ohlcv(pair_id, "H1", 300)
+
+                df_h1 = self._fetch_ohlcv(pair_id, "H1", 300)
                 if df_h1 is not None and len(df_h1) >= 15:
                     atr_abs = float(_atr_series(df_h1).iloc[-1])
                     close   = float(df_h1["Close"].iloc[-1])
                     atr_pct = (atr_abs / close) * 100 if close > 0 else None
                 else:
                     atr_pct = None
-                # MAJ‑013 : direction correcte pour l’instrument tradable
+
                 direction = "BUY" if pair_id == pair_direct else "SELL"
                 candidates.append({
-                    "pair":       pair_direct,        # pour info
-                    "exec_pair":  pair_id,            # paire OANDA réelle
+                    "pair":       pair_direct,
+                    "exec_pair":  pair_id,
                     "diff":       round(diff, 3),
                     "atr":        round(atr_pct, 4) if atr_pct is not None else None,
                     "base":       base,
                     "quote":      quote,
                     "direction":  direction,
                 })
+
         if not candidates:
             return [], []
-        # Filtre ATR normalisé
+
         atr_values = [c["atr"] for c in candidates if c["atr"] is not None]
         if atr_values:
             threshold = float(np.percentile(atr_values, ATR_MIN_PERCENTILE))
-            candidates = [c for c in candidates if c["atr"] is not None and c["atr"] >= threshold]
+            candidates = [
+                c for c in candidates
+                if c["atr"] is not None and c["atr"] >= threshold
+            ]
         if not candidates:
             return [], []
-        # MAJ‑014 : anti‑concentration
+
         used_currencies: set = set()
         filtered = []
         for c in sorted(candidates, key=lambda x: x["diff"], reverse=True):
@@ -550,11 +625,11 @@ class StrengthEngine:
     # ── Points d'entrée publics ───────────────────────────────────────────────
 
     def run(self) -> StrengthResult:
+        """Exécute le calcul complet multi-timeframe."""
         self._cache.clear()
         self.errors.clear()
         total, weight_sum  = self._compute_mtf_scores()
         if all(ws == 0 for ws in weight_sum.values()):
-            # CRIT‑002 : aucune donnée → signal invalide
             return StrengthResult(
                 valid=False,
                 warnings=["Aucune donnée marché reçue. Vérifiez la connexion / token."]
@@ -565,9 +640,9 @@ class StrengthEngine:
         velocity           = self._compute_velocity()
         best_pairs, pairs_detail = self._select_pairs(scores_display)
 
-        # Couverture par devise
+        total_weight = sum(cfg["weight"] for cfg in TIMEFRAMES_MTF.values())
         coverage = {
-            c: weight_sum[c] / sum(TIMEFRAMES_MTF[tf]["weight"] for tf in TIMEFRAMES_MTF)
+            c: weight_sum[c] / total_weight
             for c in CURRENCIES
         }
         warnings = []
@@ -591,7 +666,7 @@ class StrengthEngine:
         )
 
     def run_quick(self, granularity: str = "H1") -> StrengthResult:
-        # Conservé pour compatibilité, applique les mêmes corrections de base
+        """Version rapide mono-timeframe (conservée pour compatibilité)."""
         self._cache.clear()
         self.errors.clear()
         total:      Dict[str, float] = {c: 0.0 for c in CURRENCIES}
@@ -607,15 +682,22 @@ class StrengthEngine:
             trend, strength = _TREND_FN[tf](df)
             weight_sum[base]  += weight
             weight_sum[quote] += weight
-            if   trend == "Bullish": contrib = +weight * (strength / 100)
-            elif trend == "Bearish": contrib = -weight * (strength / 100)
-            else: contrib = 0.0
+
+            if trend == "Bullish":
+                contrib = +weight * (strength / 100)
+            elif trend == "Bearish":
+                contrib = -weight * (strength / 100)
+            else:
+                contrib = 0.0
+
             total[base]  += contrib
             total[quote] -= contrib
+
         if tf != "H1":
             cfg_h1 = TIMEFRAMES_MTF["H1"]
             for pair in PAIRS:
                 self._fetch_ohlcv(pair, cfg_h1["gran_fetch"], cfg_h1["count"])
+
         scores         = self._normalize(total, weight_sum)
         scores_display = self._to_display(scores)
         ranking        = sorted(scores.keys(), key=lambda c: scores[c], reverse=True)
@@ -700,23 +782,25 @@ FOREX_PAIRS = PAIRS
 # ── 2. Clients & données avec cache isolé ─────────────────────────────────────
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _run_engine_cached(_token_fp: str, env: str) -> StrengthResult:
-    """Cache basé sur l'empreinte du token + env (MAJ‑021)."""
-    token = st.secrets["OANDA_ACCESS_TOKEN"]   # le token réel, déjà chargé
-    client = _create_client(token, env)
+def _run_engine_cached(_token_fp: str, environment: str) -> StrengthResult:
+    """Cache basé sur l'empreinte du token + env."""
+    access_token = st.secrets["OANDA_ACCESS_TOKEN"]
+    client = _create_client(access_token, environment)
     engine = StrengthEngine(client=client)
     return engine.run()
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _fetch_candles_cached(
     _token_fp: str,
-    env: str,
+    environment: str,
     instrument: str,
     granularity: str,
     count: int,
 ) -> Optional[pd.DataFrame]:
-    token = st.secrets["OANDA_ACCESS_TOKEN"]
-    client = _create_client(token, env)
+    """Récupère les chandeliers avec cache."""
+    access_token = st.secrets["OANDA_ACCESS_TOKEN"]
+    client = _create_client(access_token, environment)
     try:
         params = {"count": count, "granularity": granularity, "price": "M"}
         r = instruments.InstrumentsCandles(instrument=instrument, params=params)
@@ -735,26 +819,33 @@ def _fetch_candles_cached(
         logger.exception("Cached fetch failed for %s %s", instrument, granularity)
         return None
 
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_market_map_data(
     _token_fp: str,
-    env: str,
+    environment: str,
     gran: str,
-) -> Tuple[pd.DataFrame, Dict]:
-    """Market Map sans forward/backward fill (CRIT‑007)."""
-    pair_changes = {}
+) -> Tuple[pd.DataFrame, Dict, Dict[str, float]]:
+    """Market Map sans forward/backward fill."""
+    pair_changes: Dict[str, float] = {}
+    max_age_map = {
+        "M5": pd.Timedelta(minutes=15),
+        "M15": pd.Timedelta(minutes=45),
+        "M30": pd.Timedelta(minutes=90),
+        "H1": pd.Timedelta(hours=3),
+        "H4": pd.Timedelta(hours=8),
+        "D": pd.Timedelta(days=3),
+    }
+    max_age = max_age_map.get(gran, pd.Timedelta(hours=1))
+
     for pair in FOREX_PAIRS:
-        df = _fetch_candles_cached(_token_fp, env, pair, gran, 30)
+        df = _fetch_candles_cached(_token_fp, environment, pair, gran, 30)
         if df is None or len(df) < 2:
             continue
         closes = df["Close"].dropna()
         if len(closes) < 2:
             continue
-        # Stale check simple (MAJ‑015)
         age = pd.Timestamp.utcnow() - closes.index[-1]
-        max_age = {"M5": pd.Timedelta(minutes=15), "M15": pd.Timedelta(minutes=45),
-                   "M30": pd.Timedelta(minutes=90), "H1": pd.Timedelta(hours=3),
-                   "H4": pd.Timedelta(hours=8), "D": pd.Timedelta(days=3)}.get(gran, pd.Timedelta(hours=1))
         if age > max_age:
             continue
         pct = float((closes.iloc[-1] / closes.iloc[-2] - 1) * 100)
@@ -762,7 +853,7 @@ def fetch_market_map_data(
 
     pct_special = {}
     for symbol, name in {**INDICES, **METAUX}.items():
-        df = _fetch_candles_cached(_token_fp, env, symbol, gran, 30)
+        df = _fetch_candles_cached(_token_fp, environment, symbol, gran, 30)
         if df is None or len(df) < 2:
             continue
         closes = df["Close"].dropna()
@@ -776,31 +867,37 @@ def fetch_market_map_data(
             "cat": "INDICES" if symbol in INDICES else "METAUX",
         }
 
-    # Reconstruction d'un DataFrame minimal pour l'affichage (juste les colonnes)
-    df_prices = pd.DataFrame({pair: [1.0] for pair in pair_changes})  # dummy, pas utilisé
-    return df_prices, pct_special, pair_changes   # on retourne aussi le dict
-
-# Note : modification du retour de fetch_market_map_data pour inclure pair_changes
+    df_prices = pd.DataFrame({pair: [1.0] for pair in pair_changes})
+    return df_prices, pct_special, pair_changes
 
 
 # ── 3. Rendu cartes ───────────────────────────────────────────────────────────
 
-import html
-
 def display_card(name: str, score: float, arrow_str: str) -> str:
-    safe_name = html.escape(name)   # MAJ‑023
-    if   score >= 7:   c_txt, c_bg = "text-green",  "bg-green"
-    elif score >= 5.5: c_txt, c_bg = "text-blue",   "bg-blue"
-    elif score >= 4:   c_txt, c_bg = "text-orange", "bg-orange"
-    else:              c_txt, c_bg = "text-red",     "bg-red"
+    """Génère la carte HTML d'une devise."""
+    safe_name = html.escape(name)
 
-    if   arrow_str == "up":   arrow, a_col = "↗", "text-green"
-    elif arrow_str == "down": arrow, a_col = "↘", "text-red"
-    else:                     arrow, a_col = "→", "text-gray"
+    if score >= 7:
+        c_txt, c_bg = "text-green",  "bg-green"
+    elif score >= 5.5:
+        c_txt, c_bg = "text-blue",   "bg-blue"
+    elif score >= 4:
+        c_txt, c_bg = "text-orange", "bg-orange"
+    else:
+        c_txt, c_bg = "text-red",     "bg-red"
+
+    if arrow_str == "up":
+        arrow, a_col = "↗", "text-green"
+    elif arrow_str == "down":
+        arrow, a_col = "↘", "text-red"
+    else:
+        arrow, a_col = "→", "text-gray"
 
     flag_code = FLAG_URLS.get(name, "xk")
-    img_html  = (f'<img src="https://flagcdn.com/48x36/{html.escape(flag_code)}.png" '
-                 f'style="width:24px; border-radius:2px;">')
+    img_html  = (
+        f'<img src="https://flagcdn.com/48x36/{html.escape(flag_code)}.png" '
+        f'style="width:24px; border-radius:2px;">'
+    )
     bar_w = min(max(score * 10, 0), 100)
 
     return f"""
@@ -818,11 +915,32 @@ def display_card(name: str, score: float, arrow_str: str) -> str:
 
 # ── 4. Market Map HTML ────────────────────────────────────────────────────────
 
-def generate_exact_map_html(pair_changes: Dict[str, float], pct_special: Dict) -> str:
+def _get_bg_color(pct: float) -> str:
+    """Couleur de fond selon le pourcentage."""
+    if pct >= 0.15:
+        return "#009900"
+    if pct >= 0.01:
+        return "#33cc33"
+    if pct <= -0.15:
+        return "#cc0000"
+    if pct <= -0.01:
+        return "#ff3300"
+    return "#f0f0f0"
+
+
+def _get_text_color(pct: float) -> str:
+    """Couleur du texte selon le pourcentage."""
+    return "#333" if -0.01 < pct < 0.01 else "white"
+
+
+def generate_exact_map_html(
+    pair_changes: Dict[str, float],
+    pct_special: Dict,
+) -> str:
+    """Génère la Market Map HTML."""
     if not pair_changes:
         return "<p style='color:#aaa;padding:1rem;'>Données insuffisantes.</p>"
 
-    # Reconstruction de la structure forex_data à partir des variations
     forex_data: Dict[str, list] = {c: [] for c in CURRENCIES}
     for pair, pct in pair_changes.items():
         parts = pair.split("_")
@@ -836,16 +954,6 @@ def generate_exact_map_html(pair_changes: Dict[str, float], pct_special: Dict) -
 
     scores      = {c: sum(x["pct"] for x in items) for c, items in forex_data.items()}
     sorted_cols = sorted(scores, key=scores.get, reverse=True)
-
-    def get_bg_color(pct: float) -> str:
-        if pct >= 0.15:  return "#009900"
-        if pct >= 0.01:  return "#33cc33"
-        if pct <= -0.15: return "#cc0000"
-        if pct <= -0.01: return "#ff3300"
-        return "#f0f0f0"
-
-    def get_text_color(pct: float) -> str:
-        return "#333" if -0.01 < pct < 0.01 else "white"
 
     html_out = """<!DOCTYPE html><html><head><style>
     body { font-family: Arial,sans-serif; background-color: transparent; margin: 0; padding: 0; }
@@ -882,43 +990,65 @@ def generate_exact_map_html(pair_changes: Dict[str, float], pct_special: Dict) -
     html_out += '<div class="matrix-row">'
     for curr in sorted_cols:
         items   = forex_data[curr]
-        winners = sorted([x for x in items if x["pct"] >= 0.01],  key=lambda x: x["pct"], reverse=True)
-        losers  = sorted([x for x in items if x["pct"] < -0.01],  key=lambda x: x["pct"])
+        winners = sorted(
+            [x for x in items if x["pct"] >= 0.01],
+            key=lambda x: x["pct"], reverse=True,
+        )
+        losers  = sorted(
+            [x for x in items if x["pct"] < -0.01],
+            key=lambda x: x["pct"],
+        )
         flat    = [x for x in items if -0.01 <= x["pct"] < 0.01]
-        html_out   += '<div class="currency-col">'
+        html_out += '<div class="currency-col">'
         for x in winners:
-            col, txt = get_bg_color(x["pct"]), get_text_color(x["pct"])
-            html_out += (f'<div class="tile" style="background:{col};color:{txt};">'
-                         f'<span>{html.escape(x["pair"])}</span><span>+{x["pct"]:.2f}%</span></div>')
+            col = _get_bg_color(x["pct"])
+            txt = _get_text_color(x["pct"])
+            html_out += (
+                f'<div class="tile" style="background:{col};color:{txt};">'
+                f'<span>{html.escape(x["pair"])}</span>'
+                f'<span>+{x["pct"]:.2f}%</span></div>'
+            )
         html_out += f'<div class="sep">{html.escape(curr)}</div>'
         for x in flat:
-            html_out += (f'<div class="tile" style="background:#f0f0f0;color:#333;">'
-                         f'<span>{html.escape(x["pair"])}</span><span>unch</span></div>')
+            html_out += (
+                f'<div class="tile" style="background:#f0f0f0;color:#333;">'
+                f'<span>{html.escape(x["pair"])}</span><span>unch</span></div>'
+            )
         for x in losers:
-            col, txt = get_bg_color(x["pct"]), get_text_color(x["pct"])
-            html_out += (f'<div class="tile" style="background:{col};color:{txt};">'
-                         f'<span>{html.escape(x["pair"])}</span><span>{x["pct"]:.2f}%</span></div>')
+            col = _get_bg_color(x["pct"])
+            txt = _get_text_color(x["pct"])
+            html_out += (
+                f'<div class="tile" style="background:{col};color:{txt};">'
+                f'<span>{html.escape(x["pair"])}</span>'
+                f'<span>{x["pct"]:.2f}%</span></div>'
+            )
         html_out += '</div>'
     html_out += '</div>'
 
     html_out += '<div class="section-header">📊 INDICES</div>'
     html_out += '<div class="grid-container">'
     for name, data in pct_special.items():
-        if data["cat"] != "INDICES": continue
+        if data["cat"] != "INDICES":
+            continue
         pct = data["pct"]
-        html_out += (f'<div class="big-box" style="background:{get_bg_color(pct)}">'
-                     f'<span class="box-name">{html.escape(name)}</span>'
-                     f'<span class="box-val">{pct:+.2f}%</span></div>')
+        html_out += (
+            f'<div class="big-box" style="background:{_get_bg_color(pct)}">'
+            f'<span class="box-name">{html.escape(name)}</span>'
+            f'<span class="box-val">{pct:+.2f}%</span></div>'
+        )
     html_out += '</div>'
 
     html_out += '<div class="section-header">🪙 METAUX</div>'
     html_out += '<div class="grid-container">'
     for name, data in pct_special.items():
-        if data["cat"] != "METAUX": continue
+        if data["cat"] != "METAUX":
+            continue
         pct = data["pct"]
-        html_out += (f'<div class="big-box" style="background:{get_bg_color(pct)}">'
-                     f'<span class="box-name">{html.escape(name)}</span>'
-                     f'<span class="box-val">{pct:+.2f}%</span></div>')
+        html_out += (
+            f'<div class="big-box" style="background:{_get_bg_color(pct)}">'
+            f'<span class="box-name">{html.escape(name)}</span>'
+            f'<span class="box-val">{pct:+.2f}%</span></div>'
+        )
     html_out += '</div></body></html>'
 
     return html_out
@@ -928,14 +1058,13 @@ def generate_exact_map_html(pair_changes: Dict[str, float], pct_special: Dict) -
 
 with st.sidebar:
     st.header("Connexion OANDA")
-    # Token déjà dans st.secrets, pas de champ texte (amélioration sécurité)
     if "OANDA_ACCESS_TOKEN" not in st.secrets:
         st.error("Token OANDA introuvable dans les secrets.")
         st.stop()
-    token = st.secrets["OANDA_ACCESS_TOKEN"]
-    env   = st.selectbox("Env", ["practice", "live"])
+    current_token = st.secrets["OANDA_ACCESS_TOKEN"]
+    current_env = st.selectbox("Env", ["practice", "live"])
     st.markdown("---")
-    granularity = st.selectbox(
+    current_granularity = st.selectbox(
         "Timeframe (Map)", ["M5", "M15", "M30", "H1", "H4", "D"], index=3
     )
     st.caption(
@@ -946,19 +1075,16 @@ with st.sidebar:
 
 # ── 6. Exécution ──────────────────────────────────────────────────────────────
 
-if token:
-    token_fp = token_fingerprint(token)
+if current_token:
+    current_fp = token_fingerprint(current_token)
     with st.status("Actualisation des données...", expanded=True) as status:
-        result = _run_engine_cached(token_fp, env)
+        result = _run_engine_cached(current_fp, current_env)
 
-        # Market Map avec le nouveau retour
-        map_data = fetch_market_map_data(token_fp, env, granularity)
-        # Adaptation pour l'ancienne signature (df_prices, pct_special)
+        map_data = fetch_market_map_data(current_fp, current_env, current_granularity)
         df_prices, pct_special, pair_changes = map_data
 
         status.update(label="✅ Données chargées", state="complete", expanded=False)
 
-    # Alertes éventuelles sans casser le layout
     if not result.valid:
         st.error("Impossible de calculer les forces : " + "; ".join(result.warnings))
     elif result.warnings:
@@ -966,7 +1092,6 @@ if token:
             st.warning(w)
 
     if result.scores_display and result.valid:
-        # Cartes Forex
         st.subheader("💱 Forces Forex (0–10) — Moteur institutionnel W/D/H4/H1")
         c1, c2, c3, c4 = st.columns(4)
         cols = [c1, c2, c3, c4]
@@ -981,7 +1106,6 @@ if token:
                     unsafe_allow_html=True,
                 )
 
-        # Meilleures paires (affichage corrigé avec exec_pair)
         if result.best_pairs:
             st.markdown("---")
             st.subheader("🎯 Paires Sélectionnées")
@@ -1000,7 +1124,6 @@ if token:
                 )
             st.markdown(badges, unsafe_allow_html=True)
 
-        # Market Map
         st.markdown("---")
         st.subheader("🗺️ Market Map Pro")
         if pair_changes:
