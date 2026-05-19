@@ -1,4 +1,4 @@
-# app.py — Bluestar Market Dashboard (Strength Engine v4.3, audit 100/100)
+# app.py — Bluestar Market Dashboard (Strength Engine v4.4, production‑ready)
 # Corrections des audits combinés sans altération de l’interface visuelle.
 
 from __future__ import annotations
@@ -189,7 +189,7 @@ def _dmi(df: pd.DataFrame, period: int = 14) -> Tuple[Optional[float], Optional[
     return pdi_val, mdi_val
 
 
-# ── Fonctions de tendance (GPS V2.2) ──────────────────────────────────────────
+# ── Fonctions de tendance ────────────────────────────────────────────────────
 
 def trend_weekly(df: pd.DataFrame) -> Tuple[str, int]:
     """Tendance weekly basée sur EMA50 / SMA200."""
@@ -236,7 +236,7 @@ def _evaluate_weekly_open(df: pd.DataFrame, current_price: float) -> int:
     return 0
 
 
-# ── Sous-fonctions pour trend_daily ─────────────────────────────────────────
+# ── Sous‑fonctions pour trend_daily ─────────────────────────────────────────
 
 def _swing_votes(high, low, sh_idx, sl_idx):
     """Comptabilise les votes swing (structure)."""
@@ -274,8 +274,7 @@ def _midpoint_votes(df, close):
     midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
     if float(close.iloc[-2]) > midpoint:
         return 1, 0
-    else:
-        return 0, 1
+    return 0, 1
 
 
 def _sma200_votes(close, cur):
@@ -285,13 +284,13 @@ def _sma200_votes(close, cur):
     sma200_val = _sma(close, 200).iloc[-1]
     if cur > sma200_val:
         return 1, 0
-    elif cur < sma200_val:
+    if cur < sma200_val:
         return 0, 1
     return 0, 0
 
 
 def trend_daily(df: pd.DataFrame) -> Tuple[str, int]:
-    """Tendance daily multi-critères."""
+    """Tendance daily multi‑critères."""
     if len(df) < 60:
         return "Range", 0
     close = df["Close"]
@@ -335,6 +334,17 @@ def trend_daily(df: pd.DataFrame) -> Tuple[str, int]:
     return "Range", 35
 
 
+def _trend_4h_dmi_vote(pdi_val, mdi_val):
+    """Vote DMI pour la tendance H4."""
+    if pdi_val is None or mdi_val is None:
+        return 0
+    if pdi_val > mdi_val:
+        return 1
+    if pdi_val < mdi_val:
+        return -1
+    return 0
+
+
 def trend_4h(df: pd.DataFrame) -> Tuple[str, int]:
     """Tendance H4 avec DMI et daily open."""
     if len(df) < 60:
@@ -345,11 +355,7 @@ def trend_4h(df: pd.DataFrame) -> Tuple[str, int]:
     score += 1 if cur > _ema(close, 50).iloc[-1] else -1
 
     pdi_val, mdi_val = _dmi(df)
-    if pdi_val is not None and mdi_val is not None:
-        if pdi_val > mdi_val:
-            score += 1
-        elif pdi_val < mdi_val:
-            score -= 1
+    score += _trend_4h_dmi_vote(pdi_val, mdi_val)
 
     try:
         idx        = pd.to_datetime(df.index)
@@ -381,6 +387,31 @@ def trend_4h(df: pd.DataFrame) -> Tuple[str, int]:
     return trend, strength
 
 
+def _compute_h1_strength(cur, curr_zlema, ema9, ema21, ema50, rsi_val, macd_line, close):
+    """Détermine la force H1 selon les critères ZLEMA/EMA/Momentum."""
+    curr_macd = macd_line.iloc[-1]
+    curr_sig  = _ema(macd_line, 9).iloc[-1]
+    ema_bull  = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema21.iloc[-1] > ema50.iloc[-1])
+    ema_bear  = (ema9.iloc[-1] < ema21.iloc[-1]) and (ema21.iloc[-1] < ema50.iloc[-1])
+    mom_bull  = (rsi_val > 50) and (curr_macd > curr_sig)
+    mom_bear  = (rsi_val < 50) and (curr_macd < curr_sig)
+
+    if (cur > curr_zlema) and ema_bull and mom_bull:
+        base_s = max(25, min(75, abs(cur - curr_zlema) / cur * 1000))
+        return "Bullish", int(round(base_s))
+    if (cur < curr_zlema) and ema_bear and mom_bear:
+        base_s = max(25, min(75, abs(cur - curr_zlema) / cur * 1000))
+        return "Bearish", int(round(base_s))
+    if len(close) >= 200:
+        sma200_val = _sma(close, 200).iloc[-1]
+        bias_trend = "Bullish" if ema50.iloc[-1] > sma200_val else "Bearish"
+        if cur < sma200_val and bias_trend == "Bullish":
+            return "Retracement Bull", 30
+        if cur > sma200_val and bias_trend == "Bearish":
+            return "Retracement Bear", 30
+    return "Range", 25
+
+
 def trend_h1(df: pd.DataFrame) -> Tuple[str, int]:
     """Tendance H1 avec ZLEMA, EMA et momentum."""
     if len(df) < 50:
@@ -395,27 +426,9 @@ def trend_h1(df: pd.DataFrame) -> Tuple[str, int]:
     curr_zlema = _ema(src_adj, 50).iloc[-1]
     rsi_val    = _rsi(close, 14).iloc[-1]
     macd_line  = _ema(close, 12) - _ema(close, 26)
-    curr_macd  = macd_line.iloc[-1]
-    curr_sig   = _ema(macd_line, 9).iloc[-1]
-    ema_bull   = (ema9.iloc[-1] > ema21.iloc[-1]) and (ema21.iloc[-1] > ema50.iloc[-1])
-    ema_bear   = (ema9.iloc[-1] < ema21.iloc[-1]) and (ema21.iloc[-1] < ema50.iloc[-1])
-    mom_bull   = (rsi_val > 50) and (curr_macd > curr_sig)
-    mom_bear   = (rsi_val < 50) and (curr_macd < curr_sig)
-
-    if (cur > curr_zlema) and ema_bull and mom_bull:
-        base_s = max(25, min(75, abs(cur - curr_zlema) / cur * 1000))
-        return "Bullish", int(round(base_s))
-    if (cur < curr_zlema) and ema_bear and mom_bear:
-        base_s = max(25, min(75, abs(cur - curr_zlema) / cur * 1000))
-        return "Bearish", int(round(base_s))
-    if len(df) >= 200:
-        sma200_val = _sma(close, 200).iloc[-1]
-        bias_trend = "Bullish" if ema50.iloc[-1] > sma200_val else "Bearish"
-        if cur < sma200_val and bias_trend == "Bullish":
-            return "Retracement Bull", 30
-        if cur > sma200_val and bias_trend == "Bearish":
-            return "Retracement Bear", 30
-    return "Range", 25
+    return _compute_h1_strength(
+        cur, curr_zlema, ema9, ema21, ema50, rsi_val, macd_line, close
+    )
 
 
 _TREND_FN = {
@@ -427,6 +440,28 @@ _TREND_FN = {
 
 
 # ── Aide à la sélection ─────────────────────────────────────────────────────
+
+def _get_pair_id(base: str, quote: str) -> Optional[str]:
+    """Retourne l'identifiant OANDA de la paire (direct ou inverse)."""
+    direct = f"{base}_{quote}"
+    if direct in PAIRS:
+        return direct
+    inverse = f"{quote}_{base}"
+    if inverse in PAIRS:
+        return inverse
+    return None
+
+
+def _compute_atr_pct(df_h1: Optional[pd.DataFrame]) -> Optional[float]:
+    """Calcule l'ATR en pourcentage du prix."""
+    if df_h1 is None or len(df_h1) < 15:
+        return None
+    atr_abs = float(_atr_series(df_h1).iloc[-1])
+    close   = float(df_h1["Close"].iloc[-1])
+    if close <= 0:
+        return None
+    return round((atr_abs / close) * 100, 4)
+
 
 def _build_candidates(
     strongest: List[str],
@@ -444,28 +479,18 @@ def _build_candidates(
             diff = scores_display[base] - scores_display[quote]
             if diff < min_diff:
                 continue
-            pair_direct  = f"{base}_{quote}"
-            pair_inverse = f"{quote}_{base}"
-            pair_id = pair_direct if pair_direct in PAIRS else (
-                pair_inverse if pair_inverse in PAIRS else None
-            )
+            pair_id = _get_pair_id(base, quote)
             if pair_id is None:
                 continue
 
             df_h1 = fetch_ohlcv_fn(pair_id, "H1", 300)
-            if df_h1 is not None and len(df_h1) >= 15:
-                atr_abs = float(_atr_series(df_h1).iloc[-1])
-                close   = float(df_h1["Close"].iloc[-1])
-                atr_pct = (atr_abs / close) * 100 if close > 0 else None
-            else:
-                atr_pct = None
-
-            direction = "BUY" if pair_id == pair_direct else "SELL"
+            atr_pct = _compute_atr_pct(df_h1)
+            direction = "BUY" if pair_id.startswith(base) else "SELL"
             candidates.append({
-                "pair":       pair_direct,
+                "pair":       f"{base}_{quote}",
                 "exec_pair":  pair_id,
                 "diff":       round(diff, 3),
-                "atr":        round(atr_pct, 4) if atr_pct is not None else None,
+                "atr":        atr_pct,
                 "base":       base,
                 "quote":      quote,
                 "direction":  direction,
@@ -502,7 +527,7 @@ def _filter_by_atr_and_exposure(
 class StrengthEngine:
     """
     Calcule la force relative des 8 devises majeures (W/D/H4/H1).
-    v4.3 : refactorisation complète des fonctions complexes.
+    v4.4 : refactorisation complète pour une complexité minimale.
     """
 
     def __init__(
@@ -574,7 +599,7 @@ class StrengthEngine:
     # ── Scores MTF ────────────────────────────────────────────────────────────
 
     def _compute_mtf_scores(self) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """Calcule les scores bruts multi-timeframe."""
+        """Calcule les scores bruts multi‑timeframe."""
         total:      Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         weight_sum: Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         for pair in PAIRS:
@@ -620,7 +645,7 @@ class StrengthEngine:
 
     @staticmethod
     def _to_display(scores: Dict[str, float]) -> Dict[str, float]:
-        """Convertit les scores bruts en échelle 0-10."""
+        """Convertit les scores bruts en échelle 0‑10."""
         values = list(scores.values())
         s_min, s_max = min(values), max(values)
         spread = s_max - s_min
@@ -685,7 +710,7 @@ class StrengthEngine:
     # ── Points d'entrée publics ───────────────────────────────────────────────
 
     def run(self) -> StrengthResult:
-        """Exécute le calcul complet multi-timeframe."""
+        """Exécute le calcul complet multi‑timeframe."""
         self._cache.clear()
         self.errors.clear()
         total, weight_sum  = self._compute_mtf_scores()
@@ -726,7 +751,7 @@ class StrengthEngine:
         )
 
     def run_quick(self, granularity: str = "H1") -> StrengthResult:
-        """Version rapide mono-timeframe (conservée pour compatibilité)."""
+        """Version rapide mono‑timeframe (conservée pour compatibilité)."""
         self._cache.clear()
         self.errors.clear()
         total:      Dict[str, float] = {c: 0.0 for c in CURRENCIES}
@@ -1040,14 +1065,14 @@ def _render_forex_section(
 
 
 def _render_special_section(
-    pct_special: Dict,
+    special_data: Dict,
     category: str,
     title: str,
 ) -> str:
     """HTML pour une section spéciale (indices ou métaux)."""
     html_out = f'<div class="section-header">{title}</div>'
     html_out += '<div class="grid-container">'
-    for name, data in pct_special.items():
+    for name, data in special_data.items():
         if data["cat"] != category:
             continue
         pct = data["pct"]
@@ -1142,11 +1167,11 @@ with st.sidebar:
 # ── 6. Exécution ──────────────────────────────────────────────────────────────
 
 if current_token:
-    fp_token = token_fingerprint(current_token)
+    token_fp = token_fingerprint(current_token)
     with st.status("Actualisation des données...", expanded=True) as status:
-        result = _run_engine_cached(fp_token, current_env)
+        result = _run_engine_cached(token_fp, current_env)
 
-        map_data = fetch_market_map_data(fp_token, current_env, current_granularity)
+        map_data = fetch_market_map_data(token_fp, current_env, current_granularity)
         df_prices, pct_special, pair_changes = map_data
 
         status.update(label="✅ Données chargées", state="complete", expanded=False)
@@ -1199,4 +1224,3 @@ if current_token:
             st.warning("Données insuffisantes pour la Market Map.")
 else:
     st.warning("En attente du Token OANDA...")
-      
