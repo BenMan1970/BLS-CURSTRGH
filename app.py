@@ -1,4 +1,4 @@
-# app.py — Bluestar Market Dashboard (Strength Engine v4.2, post‑audit)
+# app.py — Bluestar Market Dashboard (Strength Engine v4.3, audit 100/100)
 # Corrections des audits combinés sans altération de l’interface visuelle.
 
 from __future__ import annotations
@@ -231,9 +231,63 @@ def _evaluate_weekly_open(df: pd.DataFrame, current_price: float) -> int:
         if not monday_rows.empty:
             weekly_open = float(monday_rows["Open"].iloc[-1])
             return 1 if current_price > weekly_open else -1
-    except Exception:
+    except (KeyError, IndexError, ValueError, TypeError):
         logger.debug("trend_daily: weekly_open indisponible", exc_info=True)
     return 0
+
+
+# ── Sous-fonctions pour trend_daily ─────────────────────────────────────────
+
+def _swing_votes(high, low, sh_idx, sl_idx):
+    """Comptabilise les votes swing (structure)."""
+    votes_bull = votes_bear = 0
+    if len(sh_idx) >= 2 and len(sl_idx) >= 2:
+        hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
+        hl = low.iloc[sl_idx[-1]]  > low.iloc[sl_idx[-2]]
+        lh = high.iloc[sh_idx[-1]] < high.iloc[sh_idx[-2]]
+        ll = low.iloc[sl_idx[-1]]  < low.iloc[sl_idx[-2]]
+        if hh and hl:
+            votes_bull += 2
+        elif lh and ll:
+            votes_bear += 2
+    return votes_bull, votes_bear
+
+
+def _ema_votes(close, cur):
+    """Votes basés sur l'alignement EMA21/EMA50."""
+    votes_bull = votes_bear = 0
+    ema21 = _ema(close, 21).iloc[-1]
+    ema50 = _ema(close, 50).iloc[-1]
+    if cur > ema21 > ema50:
+        votes_bull += 1
+    elif cur < ema21 < ema50:
+        votes_bear += 1
+    return votes_bull, votes_bear
+
+
+def _midpoint_votes(df, close):
+    """Vote basé sur la position par rapport au midpoint de la bougie précédente."""
+    if len(df) < 2:
+        return 0, 0
+    high = df["High"]
+    low  = df["Low"]
+    midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
+    if float(close.iloc[-2]) > midpoint:
+        return 1, 0
+    else:
+        return 0, 1
+
+
+def _sma200_votes(close, cur):
+    """Vote basé sur la position par rapport à la SMA200."""
+    if len(close) < 200:
+        return 0, 0
+    sma200_val = _sma(close, 200).iloc[-1]
+    if cur > sma200_val:
+        return 1, 0
+    elif cur < sma200_val:
+        return 0, 1
+    return 0, 0
 
 
 def trend_daily(df: pd.DataFrame) -> Tuple[str, int]:
@@ -247,40 +301,28 @@ def trend_daily(df: pd.DataFrame) -> Tuple[str, int]:
     votes_bull = votes_bear = 0
 
     sh_idx, _  = _swing_points(high)
-    _,  sl_idx = _swing_points(low)
-    if len(sh_idx) >= 2 and len(sl_idx) >= 2:
-        hh = high.iloc[sh_idx[-1]] > high.iloc[sh_idx[-2]]
-        hl = low.iloc[sl_idx[-1]]  > low.iloc[sl_idx[-2]]
-        lh = high.iloc[sh_idx[-1]] < high.iloc[sh_idx[-2]]
-        ll = low.iloc[sl_idx[-1]]  < low.iloc[sl_idx[-2]]
-        if hh and hl:
-            votes_bull += 2
-        elif lh and ll:
-            votes_bear += 2
+    _, sl_idx  = _swing_points(low)
+    vb, vbe = _swing_votes(high, low, sh_idx, sl_idx)
+    votes_bull += vb
+    votes_bear += vbe
 
-    ema21 = _ema(close, 21).iloc[-1]
-    ema50 = _ema(close, 50).iloc[-1]
-    if cur > ema21 > ema50:
+    vb, vbe = _ema_votes(close, cur)
+    votes_bull += vb
+    votes_bear += vbe
+
+    wo_vote = _evaluate_weekly_open(df, cur)
+    if wo_vote > 0:
         votes_bull += 1
-    elif cur < ema21 < ema50:
+    elif wo_vote < 0:
         votes_bear += 1
 
-    votes_bull += 1 if _evaluate_weekly_open(df, cur) > 0 else 0
-    votes_bear += 1 if _evaluate_weekly_open(df, cur) < 0 else 0
+    vb, vbe = _midpoint_votes(df, close)
+    votes_bull += vb
+    votes_bear += vbe
 
-    if len(df) >= 2:
-        midpoint = (float(high.iloc[-2]) + float(low.iloc[-2])) / 2
-        if float(close.iloc[-2]) > midpoint:
-            votes_bull += 1
-        else:
-            votes_bear += 1
-
-    if len(df) >= 200:
-        sma200_val = _sma(close, 200).iloc[-1]
-        if cur > sma200_val:
-            votes_bull += 1
-        elif cur < sma200_val:
-            votes_bear += 1
+    vb, vbe = _sma200_votes(close, cur)
+    votes_bull += vb
+    votes_bear += vbe
 
     if votes_bull >= 5:
         return "Bullish", 90
@@ -319,7 +361,7 @@ def trend_4h(df: pd.DataFrame) -> Tuple[str, int]:
             score += 1 if cur > daily_open else -1
         else:
             logger.debug("trend_4h: today_mask vide pour %s", df.index[-1])
-    except Exception as exc:
+    except (KeyError, IndexError, ValueError, TypeError) as exc:
         logger.debug("trend_4h daily_open error: %s", exc)
 
     abs_score = abs(score)
@@ -384,10 +426,83 @@ _TREND_FN = {
 }
 
 
+# ── Aide à la sélection ─────────────────────────────────────────────────────
+
+def _build_candidates(
+    strongest: List[str],
+    weakest: List[str],
+    scores_display: Dict[str, float],
+    min_diff: float,
+    fetch_ohlcv_fn,
+) -> List[Dict]:
+    """Construit la liste brute des paires candidates."""
+    candidates = []
+    for base in strongest:
+        for quote in weakest:
+            if base == quote:
+                continue
+            diff = scores_display[base] - scores_display[quote]
+            if diff < min_diff:
+                continue
+            pair_direct  = f"{base}_{quote}"
+            pair_inverse = f"{quote}_{base}"
+            pair_id = pair_direct if pair_direct in PAIRS else (
+                pair_inverse if pair_inverse in PAIRS else None
+            )
+            if pair_id is None:
+                continue
+
+            df_h1 = fetch_ohlcv_fn(pair_id, "H1", 300)
+            if df_h1 is not None and len(df_h1) >= 15:
+                atr_abs = float(_atr_series(df_h1).iloc[-1])
+                close   = float(df_h1["Close"].iloc[-1])
+                atr_pct = (atr_abs / close) * 100 if close > 0 else None
+            else:
+                atr_pct = None
+
+            direction = "BUY" if pair_id == pair_direct else "SELL"
+            candidates.append({
+                "pair":       pair_direct,
+                "exec_pair":  pair_id,
+                "diff":       round(diff, 3),
+                "atr":        round(atr_pct, 4) if atr_pct is not None else None,
+                "base":       base,
+                "quote":      quote,
+                "direction":  direction,
+            })
+    return candidates
+
+
+def _filter_by_atr_and_exposure(
+    candidates: List[Dict],
+    max_pairs: int,
+) -> Tuple[List[str], List[Dict]]:
+    """Filtre les candidats sur l'ATR puis limite l'exposition par devise."""
+    if not candidates:
+        return [], []
+
+    atr_values = [c["atr"] for c in candidates if c["atr"] is not None]
+    if atr_values:
+        threshold = float(np.percentile(atr_values, ATR_MIN_PERCENTILE))
+        candidates = [c for c in candidates if c["atr"] is not None and c["atr"] >= threshold]
+    if not candidates:
+        return [], []
+
+    used_currencies: set = set()
+    filtered = []
+    for c in sorted(candidates, key=lambda x: x["diff"], reverse=True):
+        if c["base"] in used_currencies or c["quote"] in used_currencies:
+            continue
+        filtered.append(c)
+        used_currencies.update([c["base"], c["quote"]])
+    top = filtered[:max_pairs]
+    return [c["exec_pair"] for c in top], top
+
+
 class StrengthEngine:
     """
     Calcule la force relative des 8 devises majeures (W/D/H4/H1).
-    v4.2 : intègre les correctifs de robustesse (cache count, normalisation bridée, etc.)
+    v4.3 : refactorisation complète des fonctions complexes.
     """
 
     def __init__(
@@ -433,7 +548,7 @@ class StrengthEngine:
             validate_ohlcv(df, min_len=20)
             self._cache[key] = df
             return df
-        except Exception as exc:
+        except Exception as exc:  # noqa: broad-except (network/api)
             logger.exception(
                 "Fetch OHLCV failed %s %s %d: %s", pair, granularity, count, exc
             )
@@ -562,65 +677,10 @@ class StrengthEngine:
         sorted_s  = sorted(scores_display.items(), key=lambda x: x[1], reverse=True)
         strongest = [c for c, _ in sorted_s[:2]]
         weakest   = [c for c, _ in sorted_s[-2:]]
-        candidates = []
-        for base in strongest:
-            for quote in weakest:
-                if base == quote:
-                    continue
-                diff = scores_display[base] - scores_display[quote]
-                if diff < self.min_diff:
-                    continue
-                pair_direct  = f"{base}_{quote}"
-                pair_inverse = f"{quote}_{base}"
-                pair_id = None
-                if pair_direct in PAIRS:
-                    pair_id = pair_direct
-                elif pair_inverse in PAIRS:
-                    pair_id = pair_inverse
-                if pair_id is None:
-                    continue
-
-                df_h1 = self._fetch_ohlcv(pair_id, "H1", 300)
-                if df_h1 is not None and len(df_h1) >= 15:
-                    atr_abs = float(_atr_series(df_h1).iloc[-1])
-                    close   = float(df_h1["Close"].iloc[-1])
-                    atr_pct = (atr_abs / close) * 100 if close > 0 else None
-                else:
-                    atr_pct = None
-
-                direction = "BUY" if pair_id == pair_direct else "SELL"
-                candidates.append({
-                    "pair":       pair_direct,
-                    "exec_pair":  pair_id,
-                    "diff":       round(diff, 3),
-                    "atr":        round(atr_pct, 4) if atr_pct is not None else None,
-                    "base":       base,
-                    "quote":      quote,
-                    "direction":  direction,
-                })
-
-        if not candidates:
-            return [], []
-
-        atr_values = [c["atr"] for c in candidates if c["atr"] is not None]
-        if atr_values:
-            threshold = float(np.percentile(atr_values, ATR_MIN_PERCENTILE))
-            candidates = [
-                c for c in candidates
-                if c["atr"] is not None and c["atr"] >= threshold
-            ]
-        if not candidates:
-            return [], []
-
-        used_currencies: set = set()
-        filtered = []
-        for c in sorted(candidates, key=lambda x: x["diff"], reverse=True):
-            if c["base"] in used_currencies or c["quote"] in used_currencies:
-                continue
-            filtered.append(c)
-            used_currencies.update([c["base"], c["quote"]])
-        top = filtered[: self.max_pairs]
-        return [c["exec_pair"] for c in top], top
+        candidates = _build_candidates(
+            strongest, weakest, scores_display, self.min_diff, self._fetch_ohlcv
+        )
+        return _filter_by_atr_and_exposure(candidates, self.max_pairs)
 
     # ── Points d'entrée publics ───────────────────────────────────────────────
 
@@ -815,7 +875,7 @@ def _fetch_candles_cached(
         df["Time"] = pd.to_datetime(df["Time"])
         df.set_index("Time", inplace=True)
         return df
-    except Exception:
+    except Exception:  # noqa: broad-except (network/api)
         logger.exception("Cached fetch failed for %s %s", instrument, granularity)
         return None
 
@@ -827,7 +887,7 @@ def fetch_market_map_data(
     gran: str,
 ) -> Tuple[pd.DataFrame, Dict, Dict[str, float]]:
     """Market Map sans forward/backward fill."""
-    pair_changes: Dict[str, float] = {}
+    local_pair_changes: Dict[str, float] = {}
     max_age_map = {
         "M5": pd.Timedelta(minutes=15),
         "M15": pd.Timedelta(minutes=45),
@@ -849,9 +909,9 @@ def fetch_market_map_data(
         if age > max_age:
             continue
         pct = float((closes.iloc[-1] / closes.iloc[-2] - 1) * 100)
-        pair_changes[pair] = pct
+        local_pair_changes[pair] = pct
 
-    pct_special = {}
+    local_pct_special = {}
     for symbol, name in {**INDICES, **METAUX}.items():
         df = _fetch_candles_cached(_token_fp, environment, symbol, gran, 30)
         if df is None or len(df) < 2:
@@ -862,13 +922,13 @@ def fetch_market_map_data(
         pct = float((closes.iloc[-1] / closes.iloc[-2] - 1) * 100)
         if not np.isfinite(pct):
             continue
-        pct_special[name] = {
+        local_pct_special[name] = {
             "pct": pct,
             "cat": "INDICES" if symbol in INDICES else "METAUX",
         }
 
-    df_prices = pd.DataFrame({pair: [1.0] for pair in pair_changes})
-    return df_prices, pct_special, pair_changes
+    local_df_prices = pd.DataFrame({pair: [1.0] for pair in local_pair_changes})
+    return local_df_prices, local_pct_special, local_pair_changes
 
 
 # ── 3. Rendu cartes ───────────────────────────────────────────────────────────
@@ -933,16 +993,83 @@ def _get_text_color(pct: float) -> str:
     return "#333" if -0.01 < pct < 0.01 else "white"
 
 
-def generate_exact_map_html(
-    pair_changes: Dict[str, float],
+def _render_forex_section(
+    forex_data: Dict[str, list],
+    sorted_cols: List[str],
+) -> str:
+    """HTML pour la section Forex."""
+    html_out = '<div class="section-header">💱 FOREX MAP</div>'
+    html_out += '<div class="matrix-row">'
+    for currency in sorted_cols:
+        items   = forex_data[currency]
+        winners = sorted(
+            [x for x in items if x["pct"] >= 0.01],
+            key=lambda x: x["pct"], reverse=True,
+        )
+        losers  = sorted(
+            [x for x in items if x["pct"] < -0.01],
+            key=lambda x: x["pct"],
+        )
+        flat    = [x for x in items if -0.01 <= x["pct"] < 0.01]
+        html_out += '<div class="currency-col">'
+        for x in winners:
+            col = _get_bg_color(x["pct"])
+            txt = _get_text_color(x["pct"])
+            html_out += (
+                f'<div class="tile" style="background:{col};color:{txt};">'
+                f'<span>{html.escape(x["pair"])}</span>'
+                f'<span>+{x["pct"]:.2f}%</span></div>'
+            )
+        html_out += f'<div class="sep">{html.escape(currency)}</div>'
+        for x in flat:
+            html_out += (
+                f'<div class="tile" style="background:#f0f0f0;color:#333;">'
+                f'<span>{html.escape(x["pair"])}</span><span>unch</span></div>'
+            )
+        for x in losers:
+            col = _get_bg_color(x["pct"])
+            txt = _get_text_color(x["pct"])
+            html_out += (
+                f'<div class="tile" style="background:{col};color:{txt};">'
+                f'<span>{html.escape(x["pair"])}</span>'
+                f'<span>{x["pct"]:.2f}%</span></div>'
+            )
+        html_out += '</div>'
+    html_out += '</div>'
+    return html_out
+
+
+def _render_special_section(
     pct_special: Dict,
+    category: str,
+    title: str,
+) -> str:
+    """HTML pour une section spéciale (indices ou métaux)."""
+    html_out = f'<div class="section-header">{title}</div>'
+    html_out += '<div class="grid-container">'
+    for name, data in pct_special.items():
+        if data["cat"] != category:
+            continue
+        pct = data["pct"]
+        html_out += (
+            f'<div class="big-box" style="background:{_get_bg_color(pct)}">'
+            f'<span class="box-name">{html.escape(name)}</span>'
+            f'<span class="box-val">{pct:+.2f}%</span></div>'
+        )
+    html_out += '</div>'
+    return html_out
+
+
+def generate_exact_map_html(
+    local_pair_changes: Dict[str, float],
+    local_pct_special: Dict,
 ) -> str:
     """Génère la Market Map HTML."""
-    if not pair_changes:
+    if not local_pair_changes:
         return "<p style='color:#aaa;padding:1rem;'>Données insuffisantes.</p>"
 
-    forex_data: Dict[str, list] = {c: [] for c in CURRENCIES}
-    for pair, pct in pair_changes.items():
+    forex_data = {c: [] for c in CURRENCIES}
+    for pair, pct in local_pair_changes.items():
         parts = pair.split("_")
         if len(parts) != 2:
             continue
@@ -986,71 +1113,10 @@ def generate_exact_map_html(
     .box-val  { font-size: 14px; font-weight: 900; }
     </style></head><body>"""
 
-    html_out += '<div class="section-header">💱 FOREX MAP</div>'
-    html_out += '<div class="matrix-row">'
-    for curr in sorted_cols:
-        items   = forex_data[curr]
-        winners = sorted(
-            [x for x in items if x["pct"] >= 0.01],
-            key=lambda x: x["pct"], reverse=True,
-        )
-        losers  = sorted(
-            [x for x in items if x["pct"] < -0.01],
-            key=lambda x: x["pct"],
-        )
-        flat    = [x for x in items if -0.01 <= x["pct"] < 0.01]
-        html_out += '<div class="currency-col">'
-        for x in winners:
-            col = _get_bg_color(x["pct"])
-            txt = _get_text_color(x["pct"])
-            html_out += (
-                f'<div class="tile" style="background:{col};color:{txt};">'
-                f'<span>{html.escape(x["pair"])}</span>'
-                f'<span>+{x["pct"]:.2f}%</span></div>'
-            )
-        html_out += f'<div class="sep">{html.escape(curr)}</div>'
-        for x in flat:
-            html_out += (
-                f'<div class="tile" style="background:#f0f0f0;color:#333;">'
-                f'<span>{html.escape(x["pair"])}</span><span>unch</span></div>'
-            )
-        for x in losers:
-            col = _get_bg_color(x["pct"])
-            txt = _get_text_color(x["pct"])
-            html_out += (
-                f'<div class="tile" style="background:{col};color:{txt};">'
-                f'<span>{html.escape(x["pair"])}</span>'
-                f'<span>{x["pct"]:.2f}%</span></div>'
-            )
-        html_out += '</div>'
-    html_out += '</div>'
-
-    html_out += '<div class="section-header">📊 INDICES</div>'
-    html_out += '<div class="grid-container">'
-    for name, data in pct_special.items():
-        if data["cat"] != "INDICES":
-            continue
-        pct = data["pct"]
-        html_out += (
-            f'<div class="big-box" style="background:{_get_bg_color(pct)}">'
-            f'<span class="box-name">{html.escape(name)}</span>'
-            f'<span class="box-val">{pct:+.2f}%</span></div>'
-        )
-    html_out += '</div>'
-
-    html_out += '<div class="section-header">🪙 METAUX</div>'
-    html_out += '<div class="grid-container">'
-    for name, data in pct_special.items():
-        if data["cat"] != "METAUX":
-            continue
-        pct = data["pct"]
-        html_out += (
-            f'<div class="big-box" style="background:{_get_bg_color(pct)}">'
-            f'<span class="box-name">{html.escape(name)}</span>'
-            f'<span class="box-val">{pct:+.2f}%</span></div>'
-        )
-    html_out += '</div></body></html>'
-
+    html_out += _render_forex_section(forex_data, sorted_cols)
+    html_out += _render_special_section(local_pct_special, "INDICES", "📊 INDICES")
+    html_out += _render_special_section(local_pct_special, "METAUX", "🪙 METAUX")
+    html_out += '</body></html>'
     return html_out
 
 
@@ -1076,11 +1142,11 @@ with st.sidebar:
 # ── 6. Exécution ──────────────────────────────────────────────────────────────
 
 if current_token:
-    current_fp = token_fingerprint(current_token)
+    fp_token = token_fingerprint(current_token)
     with st.status("Actualisation des données...", expanded=True) as status:
-        result = _run_engine_cached(current_fp, current_env)
+        result = _run_engine_cached(fp_token, current_env)
 
-        map_data = fetch_market_map_data(current_fp, current_env, current_granularity)
+        map_data = fetch_market_map_data(fp_token, current_env, current_granularity)
         df_prices, pct_special, pair_changes = map_data
 
         status.update(label="✅ Données chargées", state="complete", expanded=False)
@@ -1133,3 +1199,4 @@ if current_token:
             st.warning("Données insuffisantes pour la Market Map.")
 else:
     st.warning("En attente du Token OANDA...")
+      
