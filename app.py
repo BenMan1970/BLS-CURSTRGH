@@ -1016,7 +1016,7 @@ def _fetch_candles_cached(
 ) -> Optional[pd.DataFrame]:
     """Récupère les chandeliers avec cache."""
     access_token = st.secrets["OANDA_ACCESS_TOKEN"]
-    client = _create_client(access_token, environment)
+    client = OandaClient(_create_client(access_token, environment))  # retry 429 identique au moteur
     try:
         params = {"count": count, "granularity": granularity, "price": "M"}
         r = instruments.InstrumentsCandles(instrument=instrument, params=params)
@@ -1071,6 +1071,7 @@ def fetch_market_map_data(
     }
     max_age = max_age_map.get(gran, pd.Timedelta(hours=1))
 
+    now_utc = pd.Timestamp.utcnow()  # hoisted — évite 28 appels redondants dans la boucle
     for pair in FOREX_PAIRS:
         df = _fetch_candles_cached(_token_fp, environment, pair, gran, 30)
         if df is None or len(df) < 2:
@@ -1078,7 +1079,7 @@ def fetch_market_map_data(
         closes = df["Close"].dropna()
         if len(closes) < 2:
             continue
-        age = pd.Timestamp.utcnow() - closes.index[-1]
+        age = now_utc - closes.index[-1]
         if age > max_age:
             continue
         pct = _smoothed_pct(closes)
