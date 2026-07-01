@@ -1,3 +1,12 @@
+"""
+Bluestar Market Dashboard — Strength Engine v10.0 (production-ready).
+
+Zero-regression refactor of v4.4: identical outputs for identical OANDA payloads.
+Improvements: typed error taxonomy, 429 retry with exponential backoff + jitter,
+DI-ready OANDA client, structured logging, optional Market Map smoothing, health checks.
+
+Dependencies: streamlit, oandapyV20, pandas, numpy.
+"""
 # app.py — Bluestar Market Dashboard (Strength Engine v10.0, production-ready)
 # Zero-regression refactor of v4.4. Same outputs for identical OANDA payloads.
 # Improvements: typed error taxonomy, 429 retry with backoff, DI-ready client,
@@ -145,7 +154,7 @@ class OandaClient:
                 code = getattr(exc, "code", None)
                 if code == 429:
                     if attempt < 2:
-                        sleep_s = (2 ** attempt) + random.uniform(0, 0.5)
+                        sleep_s = (2 ** attempt) + random.uniform(0, 0.5)  # nosec B311 — jitter non-cryptographique
                         logger.warning(
                             "OANDA 429 retry %s/%s: sleep %.2fs",
                             attempt + 1, 3, sleep_s,
@@ -236,9 +245,9 @@ class StrengthResult:
                 "warnings": self.warnings,
             }
         cov_min = min(self.coverage.values()) if self.coverage else 0.0
-        status = "ok" if (cov_min >= 0.5 and not self.warnings) else "degraded"
+        status_str = "ok" if (cov_min >= 0.5 and not self.warnings) else "degraded"
         return {
-            "status": status,
+            "status": status_str,
             "coverage_min": round(cov_min, 4),
             "warnings": self.warnings,
         }
@@ -1022,7 +1031,7 @@ def _fetch_candles_cached(
         df["Time"] = pd.to_datetime(df["Time"])
         df.set_index("Time", inplace=True)
         return df
-    except Exception:
+    except (BluestarError, V20Error, KeyError, ValueError, TypeError, OSError):
         logger.exception("Cached fetch failed for %s %s", instrument, granularity)
         return None
 
