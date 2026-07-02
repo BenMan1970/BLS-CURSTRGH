@@ -15,8 +15,10 @@ Dependencies: streamlit, oandapyV20, pandas, numpy.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import html
+import json
 import logging
 import random
 import time
@@ -987,9 +989,10 @@ INDICES = {
     "DE30_EUR":   "DAX 40",
 }
 METAUX = {
-    "XAU_USD": "GOLD",
-    "XAG_USD": "SILVER",
-    "XPT_USD": "PLATINUM",
+    "XAU_USD":   "GOLD",
+    # "XAG_USD": "SILVER",  — retiré (peu pertinent pour l'analyse macro FX)
+    "XPT_USD":   "PLATINUM",
+    "WTICO_USD": "WTI CRUDE",  # ajouté — signal macro risque/OPEC
 }
 
 FOREX_PAIRS = PAIRS
@@ -1291,12 +1294,421 @@ def generate_exact_map_html(
 
     html_out += _render_forex_section(forex_data, sorted_cols)
     html_out += _render_special_section(local_pct_special, "INDICES", "📊 INDICES")
-    html_out += _render_special_section(local_pct_special, "METAUX", "🪙 METAUX")
+    html_out += _render_special_section(local_pct_special, "METAUX", "🛢️ COMMODITÉS")
     html_out += '</body></html>'
     return html_out
 
 
-# ── 5. Sidebar ────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── 5. EXPORT — JSON (pipeline macro) + PDF (briefing institutionnel) ─────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _session_label() -> str:
+    """Session active selon l'heure UTC."""
+    h = datetime.datetime.utcnow().hour
+    if 7 <= h < 12:
+        return "London"
+    if 12 <= h < 17:
+        return "London/NY Overlap"
+    if 17 <= h < 22:
+        return "New York"
+    return "Asian/Off-peak"
+
+
+def _infer_regime(pct_special: Dict) -> str:
+    """
+    Infère le régime risk-on/off depuis indices OANDA + WTI + Gold.
+    Logique : equity average > 0.10 et gold stable = RISK_ON.
+              equity < -0.10 ou gold > 0.20 avec indices négatifs = RISK_OFF.
+    """
+    indices_pcts = [d["pct"] for d in pct_special.values() if d["cat"] == "INDICES"]
+    gold_pct     = pct_special.get("GOLD",      {}).get("pct", 0.0)
+    wti_pct      = pct_special.get("WTI CRUDE", {}).get("pct", 0.0)
+
+    if not indices_pcts:
+        return "NEUTRAL"
+
+    avg_eq = sum(indices_pcts) / len(indices_pcts)
+
+    if avg_eq > 0.10 and gold_pct < 0.15 and wti_pct >= 0:
+        return "RISK_ON"
+    if avg_eq < -0.10 or (gold_pct > 0.20 and avg_eq < 0):
+        return "RISK_OFF"
+    return "NEUTRAL"
+
+
+def generate_json_export(
+    result: StrengthResult,
+    pair_changes: Dict[str, float],
+    pct_special: Dict,
+    granularity: str,
+) -> str:
+    """
+    JSON structuré pour BLUESTAR_MACRO_BRIEFING_PROMPT.
+
+    Structure :
+      oanda_data       — tout ce que OANDA v20 fournit (force devises + market map)
+      external_required — champs null à remplir via source externe avant injection LLM
+      health           — état des données
+    """
+    now = datetime.datetime.now()
+
+    # Reverse-map symbol → name for JSON symbol field
+    sym_to_name = {**INDICES, **METAUX}
+    name_to_sym = {v: k for k, v in sym_to_name.items()}
+
+    # Indices / commodités séparés
+    indices_out: Dict     = {}
+    commodities_out: Dict = {}
+    for name, data in pct_special.items():
+        sym = name_to_sym.get(name, "N/A")
+        entry = {"pct_change": round(data["pct"], 4), "symbol": sym}
+        (indices_out if data["cat"] == "INDICES" else commodities_out)[name] = entry
+
+    # Velocity labels
+    vel_label = {}
+    for c, v in result.velocity.items():
+        if v > 0.02:
+            vel_label[c] = "↗ accélère"
+        elif v < -0.02:
+            vel_label[c] = "↘ décélère"
+        else:
+            vel_label[c] = "→ stable"
+
+    # USD context
+    usd_score = result.scores_display.get("USD", 5.0)
+    usd_rank  = (result.ranking.index("USD") + 1) if "USD" in result.ranking else None
+    usd_bias  = "fort" if usd_score >= 6.5 else ("faible" if usd_score <= 3.5 else "neutre")
+
+    # Equity bias
+    idx_pctsL = [d["pct"] for d in pct_special.values() if d["cat"] == "INDICES"]
+    if idx_pctsL:
+        avg_eq = sum(idx_pctsL) / len(idx_pctsL)
+        eq_bias = "haussier" if avg_eq > 0.10 else ("baissier" if avg_eq < -0.10 else "mixte")
+    else:
+        eq_bias = "N/A"
+
+    payload = {
+        "schema_version": "1.0",
+        "meta": {
+            "date":          now.strftime("%Y-%m-%d"),
+            "timestamp":     now.isoformat(timespec="seconds"),
+            "session":       _session_label(),
+            "timeframe_map": granularity,
+            "system":        "BLUESTAR v10.0",
+        },
+        "oanda_data": {
+            "currency_strength": {
+                "ranking": result.ranking,
+                "scores": {
+                    c: {
+                        "display_0_10": result.scores_display.get(c),
+                        "velocity":     round(result.velocity.get(c, 0.0), 6),
+                        "trend":        vel_label.get(c, "→ stable"),
+                    }
+                    for c in result.ranking
+                },
+                "best_pairs":   result.best_pairs,
+                "pairs_detail": result.pairs_detail,
+                "data_quality": {
+                    "coverage_min": round(min(result.coverage.values(), default=0.0), 4),
+                    "pairs_fetched": result.pairs_fetched,
+                    "warnings":      result.warnings,
+                    "valid":         result.valid,
+                },
+            },
+            "market_map": {
+                "timeframe":   granularity,
+                "forex_pairs": {k: round(v, 4) for k, v in pair_changes.items()},
+                "indices":     indices_out,
+                "commodities": commodities_out,
+            },
+        },
+        "risk_context": {
+            "regime_inferred": _infer_regime(pct_special),
+            "usd": {
+                "score_0_10": usd_score,
+                "rank":       usd_rank,
+                "bias":       usd_bias,
+            },
+            "equity_bias": eq_bias,
+            "_note": "Régime et biais inférés depuis données OANDA — indicatifs, non definitifs.",
+        },
+        "external_required": {
+            "_note": (
+                "Ces champs sont null : non disponibles via OANDA v20. "
+                "À injecter depuis CBOE/FRED/Bloomberg avant exécution du prompt LLM."
+            ),
+            "vix":          {"value": None, "source": "CBOE"},
+            "move_index":   {"value": None, "source": "ICE"},
+            "dxy":          {"value": None, "source": "ICE/Bloomberg"},
+            "us10y":        {"value": None, "source": "FRED/Bloomberg"},
+            "cot_ips":      {"value": None, "source": "CFTC (J-3)"},
+        },
+        "health": result.health_check(),
+    }
+
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def generate_briefing_html(
+    result: StrengthResult,
+    pair_changes: Dict[str, float],
+    pct_special: Dict,
+    granularity: str,
+) -> str:
+    """
+    HTML institutionnel auto-peuplé depuis OANDA.
+    Compatible WeasyPrint (print-ready, système de couleurs BLUESTAR).
+    """
+    now      = datetime.datetime.now()
+    date_str = now.strftime("%d/%m/%Y")
+    time_str = now.strftime("%H:%M")
+    session  = _session_label()
+    regime   = _infer_regime(pct_special)
+    hc       = result.health_check()
+    cov_pct  = int(hc.get("coverage_min", 0) * 100)
+
+    regime_map = {
+        "RISK_ON":  ("🟢 RISK ON",       "#1a7a4a", "#e8f5ee"),
+        "RISK_OFF": ("🔴 RISK OFF",      "#c0292a", "#fdecea"),
+        "NEUTRAL":  ("🟡 NEUTRE / MIXTE", "#1B45B4", "#E8EEFF"),
+    }
+    regime_label, r_col, r_bg = regime_map.get(regime, regime_map["NEUTRAL"])
+    cov_col = "#1a7a4a" if cov_pct >= 80 else "#c0292a"
+
+    # ── Currency strength rows ────────────────────────────────────────────────
+    rows_html = ""
+    for i, cur in enumerate(result.ranking):
+        score = result.scores_display.get(cur, 5.0)
+        vel   = result.velocity.get(cur, 0.0)
+        arrow, a_col = ("↗", "#1a7a4a") if vel > 0.02 else (("↘", "#c0292a") if vel < -0.02 else ("→", "#6B89D8"))
+        s_col = "#1a7a4a" if score >= 7.0 else ("#1B45B4" if score >= 5.5 else ("#b5620a" if score >= 4.0 else "#c0292a"))
+        row_bg = "#f0f3fa" if i % 2 == 0 else "#ffffff"
+        rows_html += (
+            f'<tr style="background:{row_bg};">'
+            f'<td style="text-align:center;font-weight:700;color:#6B89D8;width:40px;">{i+1}</td>'
+            f'<td style="font-weight:800;font-family:var(--mono);color:#0d1f4e;letter-spacing:.05em;">{html.escape(cur)}</td>'
+            f'<td style="text-align:center;font-weight:800;font-family:var(--mono);color:{s_col};font-size:15px;">{score:.2f}</td>'
+            f'<td style="text-align:center;font-weight:700;color:{a_col};font-family:var(--mono);">'
+            f'{arrow} <span style="font-size:10px;">{vel:+.4f}</span></td>'
+            f'</tr>'
+        )
+
+    # ── Best pairs ────────────────────────────────────────────────────────────
+    pairs_html = ""
+    for item in result.pairs_detail:
+        direction = item.get("direction", "")
+        pair_name = item.get("exec_pair", item.get("pair", ""))
+        diff      = item.get("diff", 0.0)
+        atr       = item.get("atr")
+        d_col, d_bg, d_lbl = (
+            ("#1a7a4a", "#e8f5ee", "↑ LONG")
+            if direction == "BUY"
+            else ("#c0292a", "#fdecea", "↓ SHORT")
+        )
+        atr_str = f"{atr:.4f}%" if atr else "N/A"
+        pairs_html += (
+            f'<div style="display:flex;align-items:center;gap:12px;background:#f0f3fa;'
+            f'border:1px solid #dde3f5;border-radius:6px;padding:10px 14px;margin-bottom:8px;">'
+            f'<div style="font-family:var(--mono);font-size:16px;font-weight:800;color:#0d1f4e;min-width:90px;">'
+            f'{html.escape(pair_name)}</div>'
+            f'<div style="background:{d_bg};border:1px solid {d_col};border-radius:4px;'
+            f'padding:3px 12px;font-family:var(--mono);font-size:11px;font-weight:700;color:{d_col};">'
+            f'{d_lbl}</div>'
+            f'<div style="font-family:var(--mono);font-size:11px;color:#3a4a7a;">'
+            f'Force diff: <strong>{diff:.2f}</strong></div>'
+            f'<div style="font-family:var(--mono);font-size:11px;color:#3a4a7a;">'
+            f'ATR: <strong>{atr_str}</strong></div>'
+            f'</div>'
+        )
+    if not pairs_html:
+        pairs_html = (
+            '<div style="color:#6B89D8;font-style:italic;padding:12px;font-family:var(--mono);">'
+            'Aucune paire sélectionnée — vérifier la couverture des données.</div>'
+        )
+
+    # ── Market snapshot ───────────────────────────────────────────────────────
+    def _tile(name: str, pct: float) -> str:
+        if pct >= 0.15:   bg, fg = "#009900", "white"
+        elif pct >= 0.01: bg, fg = "#33cc33", "white"
+        elif pct <= -0.15: bg, fg = "#cc0000", "white"
+        elif pct <= -0.01: bg, fg = "#ff3300", "white"
+        else:              bg, fg = "#f0f3fa", "#444"
+        sign = "+" if pct >= 0 else ""
+        return (
+            f'<div style="background:{bg};color:{fg};border-radius:6px;'
+            f'padding:12px 16px;min-width:120px;text-align:center;">'
+            f'<div style="font-family:var(--mono);font-size:9px;font-weight:700;'
+            f'text-transform:uppercase;margin-bottom:4px;">{html.escape(name)}</div>'
+            f'<div style="font-family:var(--mono);font-size:20px;font-weight:800;">'
+            f'{sign}{pct:.2f}%</div></div>'
+        )
+
+    indices_tiles    = "".join(_tile(n, d["pct"]) for n, d in pct_special.items() if d["cat"] == "INDICES")
+    commodity_tiles  = "".join(_tile(n, d["pct"]) for n, d in pct_special.items() if d["cat"] == "METAUX")
+
+    snap_html = (
+        f'<div style="margin-bottom:8px;font-family:var(--mono);font-size:9px;color:#6B89D8;'
+        f'letter-spacing:1px;font-weight:700;text-transform:uppercase;">📊 INDICES</div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;">{indices_tiles}</div>'
+        f'<div style="margin-bottom:8px;font-family:var(--mono);font-size:9px;color:#6B89D8;'
+        f'letter-spacing:1px;font-weight:700;text-transform:uppercase;">🛢️ COMMODITÉS</div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:8px;">{commodity_tiles}</div>'
+    )
+
+    # ── External placeholders ─────────────────────────────────────────────────
+    ext_kpis = [
+        ("VIX",   "CBOE"),
+        ("DXY",   "ICE"),
+        ("US10Y", "FRED"),
+        ("MOVE",  "ICE"),
+    ]
+    ext_html = "".join(
+        f'<div style="background:#f0f3fa;border:1px solid #dde3f5;border-radius:6px;'
+        f'padding:12px 16px;min-width:110px;text-align:center;border-top:2px solid #1B45B4;">'
+        f'<div style="font-size:8px;color:#6B89D8;text-transform:uppercase;letter-spacing:1px;'
+        f'font-weight:600;font-family:var(--mono);margin-bottom:4px;">{label}</div>'
+        f'<div style="font-size:22px;font-weight:700;font-family:var(--mono);color:#bbc6e8;">—</div>'
+        f'<div style="font-size:9px;color:#6B89D8;">{src} requis</div></div>'
+        for label, src in ext_kpis
+    )
+
+    # ── Full HTML ─────────────────────────────────────────────────────────────
+    return f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Macro Briefing BLUESTAR — {html.escape(date_str)}</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+:root{{
+  --royal:#1B45B4;--royal-dim:#6B89D8;--bg:#f5f7fc;--white:#fff;--card:#f0f3fa;
+  --dark:#0d1f4e;--sec:#3a4a7a;--muted:#6B89D8;--border:#dde3f5;--border2:#bbc6e8;
+  --mono:'IBM Plex Mono','Courier New',monospace;--sans:'IBM Plex Sans',system-ui,sans-serif;
+}}
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:var(--bg);color:var(--dark);font-family:var(--sans);font-size:12px;line-height:1.5}}
+#page{{max-width:1100px;margin:0 auto;padding:16px}}
+.section{{background:var(--white);border:1px solid var(--border);border-radius:8px;margin-bottom:14px;overflow:hidden}}
+.sec-hdr{{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border)}}
+.sec-num{{width:24px;height:24px;border-radius:50%;background:var(--royal);color:#fff;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;font-family:var(--mono);flex-shrink:0}}
+.sec-ttl{{font-size:12px;font-weight:700;color:var(--dark);text-transform:uppercase;letter-spacing:.5px;font-family:var(--mono)}}
+.sec-body{{padding:14px 16px}}
+table{{width:100%;border-collapse:collapse;font-size:12px}}
+thead tr{{background:var(--royal)}}
+thead th{{padding:8px 12px;text-align:left;font-size:9px;font-weight:700;color:#fff;letter-spacing:1px;text-transform:uppercase;font-family:var(--mono)}}
+tbody td{{padding:7px 12px;vertical-align:middle;border-bottom:1px solid var(--border)}}
+.page-header{{background:linear-gradient(135deg,#F8FAFF,#F0F4FE);border:1px solid var(--border);border-radius:8px 8px 0 0;display:flex;align-items:center;justify-content:space-between;padding:14px 24px}}
+.page-subbar{{background:rgba(27,69,180,.04);border:1px solid var(--border);border-top:none;padding:7px 24px;display:flex;align-items:center;gap:24px;font-size:10px;font-family:var(--mono);color:var(--sec);margin-bottom:14px}}
+.footer{{text-align:center;font-family:var(--mono);font-size:8px;color:var(--muted);border-top:1px solid var(--border);padding:10px;margin-top:4px;letter-spacing:1.5px}}
+#pdf-fab{{position:fixed;bottom:24px;right:24px;z-index:9999}}
+#pdf-fab button{{background:#1B45B4;color:#fff;border:none;padding:10px 18px;border-radius:8px;font-family:var(--mono);font-size:12px;font-weight:700;cursor:pointer;box-shadow:0 4px 16px rgba(27,69,180,.4)}}
+@media print{{
+  @page{{margin:8mm;size:A4 portrait}}
+  *{{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}}
+  body{{background:#fff!important;font-size:11px}}
+  .page-header{{background:#F8FAFF!important}}
+  thead tr{{background:var(--royal)!important}}
+  .section{{margin-bottom:8px;break-inside:auto}}
+  #page{{background:#fff;padding:0}}
+  #pdf-fab{{display:none!important}}
+}}
+</style>
+</head>
+<body>
+<div id="pdf-fab">
+  <button onclick="window.print()">📥 Télécharger PDF</button>
+</div>
+<div id="page">
+
+<div class="page-header">
+  <div style="display:flex;align-items:center;gap:14px;">
+    <div style="width:34px;height:34px;display:flex;align-items:center;justify-content:center;background:white;border:1px solid var(--border);border-radius:6px;">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+        <path d="M12 17.27L18.18 21L16.54 13.97L22 9.24L14.81 8.63L12 2L9.19 8.63L2 9.24L7.46 13.97L5.82 21L12 17.27Z" fill="#1B45B4"/>
+      </svg>
+    </div>
+    <div>
+      <div style="font-size:9px;letter-spacing:.3em;color:var(--royal-dim);font-family:var(--mono);font-weight:600;text-transform:uppercase;">BLUESTAR SYSTEM</div>
+      <div style="font-size:20px;font-weight:700;color:var(--dark);letter-spacing:-.02em;font-family:var(--mono);line-height:1.1;">BLUESTAR</div>
+      <div style="font-size:9px;color:var(--muted);font-family:var(--mono);">FX INSTITUTIONAL DESK · v10.0</div>
+    </div>
+  </div>
+  <div style="text-align:right;border-left:1px solid var(--border2);padding-left:18px;">
+    <div style="font-size:11px;color:var(--royal);font-family:var(--mono);letter-spacing:.08em;font-weight:600;text-transform:uppercase;">INSTITUTIONAL MACRO BRIEFING</div>
+    <div style="font-size:9px;color:var(--sec);font-family:var(--mono);margin-top:4px;">Analyse Quantitative — OANDA v20 API · Auto-généré</div>
+  </div>
+</div>
+
+<div class="page-subbar">
+  <span>📅 {html.escape(date_str)}</span>
+  <span>🕐 {html.escape(time_str)} CET — {html.escape(session)}</span>
+  <span style="margin-left:auto;font-weight:600;color:var(--royal);background:rgba(27,69,180,.08);padding:2px 10px;border-radius:20px;font-size:9px;">● CONFIDENTIEL</span>
+</div>
+
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">1</div><div class="sec-ttl">Force des Devises — Moteur W/D/H4/H1</div></div>
+  <div class="sec-body">
+    <div style="display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin-bottom:14px;flex-wrap:wrap;">
+      <span style="font-size:9px;font-family:var(--mono);color:var(--muted);letter-spacing:1px;text-transform:uppercase;flex-shrink:0;">Régime inféré</span>
+      <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:{r_col};background:{r_bg};padding:3px 12px;border-radius:4px;">{html.escape(regime_label)}</span>
+      <span style="margin-left:auto;font-size:10px;color:var(--muted);font-family:var(--mono);">
+        Couverture&nbsp;: <strong style="color:{cov_col};">{cov_pct}%</strong>
+        &nbsp;·&nbsp;Timeframe Map&nbsp;: <strong>{html.escape(granularity)}</strong>
+      </span>
+    </div>
+    <table>
+      <thead><tr><th>#</th><th>Devise</th><th>Score 0–10</th><th>Vélocité H1</th></tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+  </div>
+</div>
+
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">2</div><div class="sec-ttl">Paires Sélectionnées par le Moteur</div></div>
+  <div class="sec-body">{pairs_html}</div>
+</div>
+
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">3</div><div class="sec-ttl">Snapshot Marché — {html.escape(granularity)} · OANDA</div></div>
+  <div class="sec-body">{snap_html}</div>
+</div>
+
+<div class="section">
+  <div class="sec-hdr"><div class="sec-num">★</div><div class="sec-ttl">Contexte Externe — À Injecter Avant LLM</div></div>
+  <div class="sec-body">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">{ext_html}</div>
+    <div style="font-size:10px;color:var(--muted);font-family:var(--mono);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 14px;">
+      ℹ️ VIX · DXY · US10Y · MOVE non disponibles via OANDA v20 API. Injecter via CBOE / FRED / Bloomberg dans le champ <code>external_required</code> du JSON avant exécution du prompt BLUESTAR_MACRO_BRIEFING.
+    </div>
+  </div>
+</div>
+
+<div class="footer">CONFIDENTIEL — BLUESTAR SYSTEM · FX INSTITUTIONAL DESK · v10.0 · Généré le {html.escape(date_str)} {html.escape(time_str)} CET</div>
+</div>
+</body>
+</html>"""
+
+
+def generate_pdf_bytes(briefing_html: str) -> Optional[bytes]:
+    """
+    Convertit le HTML en PDF via WeasyPrint.
+    Retourne None si WeasyPrint n'est pas installé (fallback HTML dans l'UI).
+    """
+    try:
+        from weasyprint import HTML as WP_HTML  # type: ignore[import]
+        return WP_HTML(string=briefing_html).write_pdf()
+    except ImportError:
+        logger.warning("WeasyPrint non disponible — export PDF désactivé (fallback HTML).")
+        return None
+    except (BluestarError, OSError, ValueError) as exc:
+        logger.error("WeasyPrint erreur de rendu: %s", exc)
+        return None
+
+
+# ── 6. Sidebar ────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.header("Connexion OANDA")
@@ -1387,5 +1799,43 @@ if current_token:
             st.components.v1.html(html_map, height=600, scrolling=True)
         else:
             st.warning("Données insuffisantes pour la Market Map.")
+
+        # ── Exports ───────────────────────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("📤 Exports")
+        col_json, col_pdf = st.columns(2)
+        fname_date = datetime.date.today().strftime("%Y-%m-%d")
+
+        with col_json:
+            json_str = generate_json_export(result, pair_changes, pct_special, current_granularity)
+            st.download_button(
+                label     = "📊 Export JSON — Pipeline Macro",
+                data      = json_str,
+                file_name = f"BLUESTAR_{fname_date}.json",
+                mime      = "application/json",
+                help      = "JSON structuré pour BLUESTAR_MACRO_BRIEFING_PROMPT · champs external_required à compléter",
+            )
+            st.caption("JSON exploitable : force devises, market map DAX/WTI/indices, paires sélectionnées, placeholders VIX/DXY/US10Y.")
+
+        with col_pdf:
+            briefing_html_str = generate_briefing_html(result, pair_changes, pct_special, current_granularity)
+            pdf_bytes = generate_pdf_bytes(briefing_html_str)
+            if pdf_bytes:
+                st.download_button(
+                    label     = "📥 Export PDF — Briefing Institutionnel",
+                    data      = pdf_bytes,
+                    file_name = f"Macro_Briefing_BLUESTAR_{fname_date}.pdf",
+                    mime      = "application/pdf",
+                )
+                st.caption("PDF auto-généré : force devises, paires, snapshot marché, placeholders externes.")
+            else:
+                # WeasyPrint absent — HTML fallback (Chrome → Enregistrer en PDF)
+                st.download_button(
+                    label     = "📄 Export HTML → PDF via Chrome",
+                    data      = briefing_html_str,
+                    file_name = f"Macro_Briefing_BLUESTAR_{fname_date}.html",
+                    mime      = "text/html",
+                )
+                st.caption("WeasyPrint non détecté. Ouvrir le HTML dans Chrome → Ctrl+P → Enregistrer en PDF (activer Graphiques d'arrière-plan).")
 else:
     st.warning("En attente du Token OANDA...")
