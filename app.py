@@ -102,15 +102,16 @@ TIMEFRAMES_MTF: Dict[str, dict] = {
 # ==========================================
 
 def _create_client(access_token: str, environment: str) -> API:
-    """Crée un client OANDA avec timeout."""
-    session = API(access_token=access_token, environment=environment)
-    original_request = session.request
-
-    def patched_request(endpoint, timeout=HTTP_TIMEOUT):
-        return original_request(endpoint, timeout=timeout)
-
-    session.request = patched_request
-    return session
+    """
+    Crée un client OANDA avec timeout HTTP configuré au niveau session (request_params).
+    oandapyV20.API.request(endpoint) n'accepte pas de kwarg timeout — il doit
+    être injecté via request_params à la construction, pas à chaque appel.
+    """
+    return API(
+        access_token=access_token,
+        environment=environment,
+        request_params={"timeout": HTTP_TIMEOUT},
+    )
 
 
 def validate_ohlcv(df: pd.DataFrame, min_len: int = 20) -> None:
@@ -151,7 +152,7 @@ class OandaClient:
         last_err: Optional[Exception] = None
         for attempt in range(3):
             try:
-                return self._api.request(endpoint, timeout=timeout)
+                return self._api.request(endpoint)  # timeout géré via request_params à la construction
             except V20Error as exc:
                 code = getattr(exc, "code", None)
                 if code == 429:
