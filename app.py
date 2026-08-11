@@ -1,17 +1,14 @@
 """
-Bluestar Market Dashboard — Strength Engine v10.0 (production-ready).
+Bluestar Market Dashboard — Strength Engine v10.1 (UI Refresh).
 
-Zero-regression refactor of v4.4: identical outputs for identical OANDA payloads.
-Improvements: typed error taxonomy, 429 retry with exponential backoff + jitter,
-DI-ready OANDA client, structured logging, optional Market Map smoothing, health checks.
+Zero-regression sur le moteur : identique à v10.0 / v4.4 pour des payloads OANDA identiques.
+Nouveautés v10.1 : design system unifié (typographie, palette, espacements), cartes devises
+redessinées, Market Map heatmap dark-theme, briefing PDF épuré, hiérarchie visuelle revue.
 
 Dependencies: streamlit, oandapyV20, pandas, numpy.
 """
-# app.py — Bluestar Market Dashboard (Strength Engine v10.0, production-ready)
-# Zero-regression refactor of v4.4. Same outputs for identical OANDA payloads.
-# Improvements: typed error taxonomy, 429 retry with backoff, DI-ready client,
-#              structured logging, optional map smoothing, health checks.
-# Dependencies: streamlit, oandapyV20, pandas, numpy
+# app.py — Bluestar Market Dashboard (Strength Engine v10.1)
+# Moteur inchangé. Refonte visuelle complète : design system, cartes, map, briefing.
 
 from __future__ import annotations
 
@@ -37,7 +34,6 @@ from oandapyV20.exceptions import V20Error
 # ── CONFIGURATION ─────────────────────────
 # ==========================================
 
-# All tunables. Defaults == v4.4 constants.
 MIN_STRENGTH_DIFF: float = 1.5
 ATR_MIN_PERCENTILE: int = 25
 MAX_PAIRS: int = 3
@@ -49,6 +45,34 @@ HTTP_TIMEOUT: float = 8.0
 MAP_SMOOTH_WINDOW: int = 1
 
 logger = logging.getLogger(__name__)
+
+
+# ==========================================
+# ── DESIGN TOKENS ─────────────────────────
+# ==========================================
+
+class T:
+    """Design tokens — source unique de vérité pour la palette."""
+    BG          = "#0A0C10"
+    BG_ELEV     = "#11151C"
+    SURFACE     = "#141A23"
+    SURFACE_2   = "#1A212C"
+    BORDER      = "#232C39"
+    BORDER_SOFT = "#1C242F"
+
+    TEXT        = "#E6EAF2"
+    TEXT_DIM    = "#9AA6B8"
+    TEXT_MUTE   = "#657084"
+
+    ACCENT      = "#4C8DFF"
+    ACCENT_DIM  = "#2F6BD8"
+
+    UP          = "#10B981"
+    UP_SOFT     = "#34D399"
+    DOWN        = "#F43F5E"
+    DOWN_SOFT   = "#FB7185"
+    WARN        = "#F59E0B"
+    NEUTRAL     = "#94A3B8"
 
 
 # ==========================================
@@ -102,12 +126,7 @@ TIMEFRAMES_MTF: Dict[str, dict] = {
 # ==========================================
 
 def _create_client(access_token: str, environment: str) -> API:
-    """
-    Crée un client OANDA v20.
-    Pattern identique à v4.4 (qui fonctionnait) : API brut sans timeout injection.
-    Le timeout par défaut de requests.Session s'applique.
-    La valeur ajoutée de OandaClient est le retry 429, pas la gestion du timeout.
-    """
+    """Crée un client OANDA v20 (pattern v4.4, sans injection de timeout)."""
     return API(access_token=access_token, environment=environment)
 
 
@@ -136,10 +155,7 @@ def token_fingerprint(access_token: str) -> str:
 # ==========================================
 
 class OandaClient:
-    """
-    Client OANDA with typed error taxonomy and 429 retry.
-    Backward-compatible: replaces the raw API object in StrengthEngine.
-    """
+    """Client OANDA avec taxonomie d'erreurs typée et retry 429."""
 
     def __init__(self, api: API) -> None:
         self._api = api
@@ -154,7 +170,7 @@ class OandaClient:
                 code = getattr(exc, "code", None)
                 if code == 429:
                     if attempt < 2:
-                        sleep_s = (2 ** attempt) + random.uniform(0, 0.5)  # nosec B311 — jitter non-cryptographique
+                        sleep_s = (2 ** attempt) + random.uniform(0, 0.5)  # nosec B311
                         logger.warning(
                             "OANDA 429 retry %s/%s: sleep %.2fs",
                             attempt + 1, 3, sleep_s,
@@ -165,18 +181,11 @@ class OandaClient:
                         f"OANDA 429 après 3 tentatives: {exc}"
                     ) from exc
                 if code in (401, 403):
-                    raise BluestarAuthError(
-                        f"OANDA auth {code}: {exc}"
-                    ) from exc
-                raise BluestarDataError(
-                    f"OANDA error {code}: {exc}"
-                ) from exc
+                    raise BluestarAuthError(f"OANDA auth {code}: {exc}") from exc
+                raise BluestarDataError(f"OANDA error {code}: {exc}") from exc
             except (TimeoutError, ConnectionError) as exc:
                 if attempt < 2:
-                    logger.warning(
-                        "OANDA timeout retry %s/%s: %s",
-                        attempt + 1, 3, exc,
-                    )
+                    logger.warning("OANDA timeout retry %s/%s: %s", attempt + 1, 3, exc)
                     time.sleep(1.0)
                     continue
                 raise BluestarTimeout(str(exc)) from exc
@@ -353,7 +362,7 @@ def _evaluate_weekly_open(df: pd.DataFrame, current_price: float) -> int:
     return 0
 
 
-# ── Sous‑fonctions pour trend_daily ─────────────────────────────────────────
+# ── Sous-fonctions pour trend_daily ─────────────────────────────────────────
 
 def _swing_votes(high, low, sh_idx, sl_idx):
     """Comptabilise les votes swing (structure)."""
@@ -407,7 +416,7 @@ def _sma200_votes(close, cur):
 
 
 def trend_daily(df: pd.DataFrame) -> Tuple[str, int]:
-    """Tendance daily multi‑critères."""
+    """Tendance daily multi-critères."""
     if len(df) < 60:
         return "Range", 0
     close = df["Close"]
@@ -648,7 +657,6 @@ def _filter_by_atr_and_exposure(
 class StrengthEngine:
     """
     Calcule la force relative des 8 devises majeures (W/D/H4/H1).
-    v10.0 : client OANDA avec résilience, error taxonomy, logging structuré.
     Sémantique numérique identique à v4.4. Backward-compatible.
     """
 
@@ -658,7 +666,7 @@ class StrengthEngine:
         min_diff: float = MIN_STRENGTH_DIFF,
         max_pairs: int  = MAX_PAIRS,
     ):
-        self.api       = OandaClient(client)  # v10: wrapper avec retry 429
+        self.api       = OandaClient(client)
         self.min_diff  = min_diff
         self.max_pairs = max_pairs
         self._cache: Dict[tuple, pd.DataFrame] = {}
@@ -696,7 +704,6 @@ class StrengthEngine:
             self._cache[key] = df
             return df
         except BluestarError as exc:
-            # v10: typed exceptions instead of broad except. Same fail-open contract.
             logger.warning(
                 "Fetch OHLCV failed %s %s %d: %s (%s)",
                 pair, granularity, count, type(exc).__name__, exc,
@@ -723,7 +730,7 @@ class StrengthEngine:
     # ── Scores MTF ────────────────────────────────────────────────────────────
 
     def _compute_mtf_scores(self) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """Calcule les scores bruts multi‑timeframe."""
+        """Calcule les scores bruts multi-timeframe."""
         total:      Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         weight_sum: Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         for pair in PAIRS:
@@ -769,7 +776,7 @@ class StrengthEngine:
 
     @staticmethod
     def _to_display(scores: Dict[str, float]) -> Dict[str, float]:
-        """Convertit les scores bruts en échelle 0‑10."""
+        """Convertit les scores bruts en échelle 0-10."""
         values = list(scores.values())
         s_min, s_max = min(values), max(values)
         spread = s_max - s_min
@@ -834,7 +841,7 @@ class StrengthEngine:
     # ── Points d'entrée publics ───────────────────────────────────────────────
 
     def run(self) -> StrengthResult:
-        """Exécute le calcul complet multi‑timeframe."""
+        """Exécute le calcul complet multi-timeframe."""
         t0 = time.perf_counter()
         self._cache.clear()
         self.errors.clear()
@@ -851,10 +858,7 @@ class StrengthEngine:
         best_pairs, pairs_detail = self._select_pairs(scores_display)
 
         total_weight = sum(cfg["weight"] for cfg in TIMEFRAMES_MTF.values())
-        coverage = {
-            c: weight_sum[c] / total_weight
-            for c in CURRENCIES
-        }
+        coverage = {c: weight_sum[c] / total_weight for c in CURRENCIES}
         warnings = []
         if self.errors:
             warnings.append(f"{len(self.errors)} erreur(s) API (voir logs).")
@@ -882,7 +886,7 @@ class StrengthEngine:
         )
 
     def run_quick(self, granularity: str = "H1") -> StrengthResult:
-        """Version rapide mono‑timeframe (conservée pour compatibilité)."""
+        """Version rapide mono-timeframe (conservée pour compatibilité)."""
         self._cache.clear()
         self.errors.clear()
         total:      Dict[str, float] = {c: 0.0 for c in CURRENCIES}
@@ -934,44 +938,214 @@ class StrengthEngine:
 # ── DASHBOARD STREAMLIT ────────────────────
 # ==========================================
 
-st.set_page_config(page_title="Bluestar Market Dashboard", layout="wide")
+st.set_page_config(
+    page_title="Bluestar — FX Institutional Desk",
+    page_icon="◆",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 st.markdown("""
 <style>
-    .stApp { background-color: #0e1117; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700;800&display=swap');
 
-    .currency-card {
-        background-color: #1f2937;
-        border-radius: 8px;
-        padding: 12px;
-        margin-bottom: 8px;
-        border: 1px solid #374151;
-        text-align: center;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-    }
-    .card-header {
-        display: flex; justify-content: center; align-items: center; gap: 8px;
-        font-weight: bold; color: #e5e7eb; font-size: 1rem;
-        margin-bottom: 5px;
-    }
-    .asset-name { font-family: 'Segoe UI', sans-serif; letter-spacing: 1px; }
+:root{
+  --bs-bg:#0A0C10; --bs-elev:#11151C; --bs-surface:#141A23; --bs-surface2:#1A212C;
+  --bs-border:#232C39; --bs-border-soft:#1C242F;
+  --bs-text:#E6EAF2; --bs-dim:#9AA6B8; --bs-mute:#657084;
+  --bs-accent:#4C8DFF; --bs-up:#10B981; --bs-down:#F43F5E; --bs-warn:#F59E0B;
+  --mono:'JetBrains Mono', ui-monospace, monospace;
+  --sans:'Inter', -apple-system, system-ui, sans-serif;
+}
 
-    .strength-score {
-        font-size: 2.2rem; font-weight: 800; margin: 0; line-height: 1.1;
-        display: flex; justify-content: center; align-items: center; gap: 10px;
-    }
-    .velocity-arrow { font-size: 1.2rem; }
-    .progress-bg  { background-color: #374151; height: 5px; border-radius: 3px; width: 100%; margin-top: 8px; }
-    .progress-fill { height: 100%; border-radius: 3px; transition: width 0.5s; }
+/* ── Base ───────────────────────────────────────────── */
+.stApp{
+  background:
+    radial-gradient(1100px 600px at 12% -8%, rgba(76,141,255,.10), transparent 60%),
+    radial-gradient(900px 500px at 92% 0%, rgba(16,185,129,.06), transparent 55%),
+    var(--bs-bg);
+  color:var(--bs-text);
+  font-family:var(--sans);
+}
+.block-container{ padding-top:1.4rem; padding-bottom:3rem; max-width:1500px; }
+#MainMenu, footer, header{ visibility:hidden; }
+::-webkit-scrollbar{ width:9px; height:9px; }
+::-webkit-scrollbar-track{ background:transparent; }
+::-webkit-scrollbar-thumb{ background:#26303E; border-radius:6px; }
+::-webkit-scrollbar-thumb:hover{ background:#33404F; }
 
-    .text-green  { color: #10B981; } .bg-green  { background-color: #10B981; }
-    .text-blue   { color: #3B82F6; } .bg-blue   { background-color: #3B82F6; }
-    .text-orange { color: #F59E0B; } .bg-orange { background-color: #F59E0B; }
-    .text-red    { color: #EF4444; } .bg-red    { background-color: #EF4444; }
-    .text-gray   { color: #6b7280; }
+h1,h2,h3,h4{ font-family:var(--sans); color:var(--bs-text); letter-spacing:-.02em; }
 
-    iframe { width: 100% !important; }
-    #MainMenu, footer, header { visibility: hidden; }
+/* ── App header ─────────────────────────────────────── */
+.bs-header{
+  display:flex; align-items:center; justify-content:space-between; gap:20px;
+  padding:18px 24px; margin-bottom:18px;
+  background:linear-gradient(135deg, rgba(30,40,56,.85), rgba(17,21,28,.92));
+  border:1px solid var(--bs-border); border-radius:16px;
+  box-shadow:0 12px 40px rgba(0,0,0,.45);
+}
+.bs-brand{ display:flex; align-items:center; gap:14px; }
+.bs-logo{
+  width:42px; height:42px; border-radius:12px; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center;
+  background:linear-gradient(140deg, #4C8DFF, #1E3FA8);
+  box-shadow:0 6px 18px rgba(76,141,255,.35);
+  font-size:19px; color:#fff;
+}
+.bs-eyebrow{
+  font-family:var(--mono); font-size:9.5px; font-weight:600; letter-spacing:.28em;
+  color:var(--bs-accent); text-transform:uppercase;
+}
+.bs-title{ font-size:21px; font-weight:700; letter-spacing:-.03em; line-height:1.15; }
+.bs-sub{ font-family:var(--mono); font-size:10.5px; color:var(--bs-mute); margin-top:2px; }
+.bs-headmeta{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+
+.bs-chip{
+  display:inline-flex; align-items:center; gap:7px;
+  font-family:var(--mono); font-size:10.5px; font-weight:600; letter-spacing:.06em;
+  padding:6px 13px; border-radius:999px;
+  background:var(--bs-surface2); border:1px solid var(--bs-border); color:var(--bs-dim);
+}
+.bs-chip.on   { color:#6EE7B7; border-color:rgba(16,185,129,.35); background:rgba(16,185,129,.10); }
+.bs-chip.off  { color:#FDA4AF; border-color:rgba(244,63,94,.35);  background:rgba(244,63,94,.10); }
+.bs-chip.neu  { color:#93B4FF; border-color:rgba(76,141,255,.35); background:rgba(76,141,255,.10); }
+.bs-dot{ width:6px; height:6px; border-radius:50%; background:currentColor; box-shadow:0 0 8px currentColor; }
+
+/* ── Section titles ─────────────────────────────────── */
+.bs-sec{ display:flex; align-items:center; gap:12px; margin:26px 0 14px 0; }
+.bs-sec-bar{ width:3px; height:17px; border-radius:2px; background:linear-gradient(180deg,#4C8DFF,#1E3FA8); }
+.bs-sec-t{ font-size:12.5px; font-weight:700; letter-spacing:.14em; text-transform:uppercase; color:var(--bs-text); }
+.bs-sec-c{ font-family:var(--mono); font-size:10px; color:var(--bs-mute); letter-spacing:.05em; }
+.bs-sec-line{ flex:1; height:1px; background:linear-gradient(90deg,var(--bs-border),transparent); }
+
+/* ── KPI strip ──────────────────────────────────────── */
+.bs-kpi{
+  background:var(--bs-surface); border:1px solid var(--bs-border-soft);
+  border-radius:12px; padding:13px 16px; height:100%;
+}
+.bs-kpi-l{ font-family:var(--mono); font-size:9px; letter-spacing:.16em; text-transform:uppercase; color:var(--bs-mute); }
+.bs-kpi-v{ font-family:var(--mono); font-size:21px; font-weight:700; margin-top:5px; letter-spacing:-.02em; font-variant-numeric:tabular-nums; }
+.bs-kpi-s{ font-family:var(--mono); font-size:9.5px; color:var(--bs-mute); margin-top:2px; }
+
+/* ── Currency cards ─────────────────────────────────── */
+.cur-card{
+  position:relative; overflow:hidden;
+  background:linear-gradient(160deg, var(--bs-surface2) 0%, var(--bs-surface) 100%);
+  border:1px solid var(--bs-border-soft); border-radius:14px;
+  padding:15px 16px 14px 16px; margin-bottom:12px;
+  transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+.cur-card:hover{ transform:translateY(-2px); border-color:var(--bs-border); box-shadow:0 14px 32px rgba(0,0,0,.45); }
+.cur-card::before{ content:""; position:absolute; top:0; left:0; right:0; height:2px; opacity:.9; }
+.cur-card.t-1::before{ background:linear-gradient(90deg,#10B981,rgba(16,185,129,0)); }
+.cur-card.t-2::before{ background:linear-gradient(90deg,#4C8DFF,rgba(76,141,255,0)); }
+.cur-card.t-3::before{ background:linear-gradient(90deg,#F59E0B,rgba(245,158,11,0)); }
+.cur-card.t-4::before{ background:linear-gradient(90deg,#F43F5E,rgba(244,63,94,0)); }
+
+.cur-top{ display:flex; align-items:center; gap:9px; }
+.cur-flag{ width:22px; height:16px; border-radius:3px; box-shadow:0 0 0 1px rgba(255,255,255,.08); display:block; }
+.cur-code{ font-family:var(--mono); font-size:13px; font-weight:700; letter-spacing:.14em; color:var(--bs-text); }
+.cur-rank{
+  margin-left:auto; font-family:var(--mono); font-size:9px; font-weight:600;
+  color:var(--bs-mute); background:rgba(255,255,255,.04);
+  border:1px solid var(--bs-border-soft); border-radius:5px; padding:2px 7px; letter-spacing:.08em;
+}
+.cur-score{
+  display:flex; align-items:baseline; gap:9px; margin:10px 0 2px 0;
+  font-family:var(--mono); font-weight:800; font-size:33px; line-height:1;
+  letter-spacing:-.035em; font-variant-numeric:tabular-nums;
+}
+.cur-max{ font-size:12px; font-weight:500; color:var(--bs-mute); letter-spacing:0; }
+.cur-vel{
+  margin-left:auto; display:inline-flex; align-items:center; gap:4px;
+  font-family:var(--mono); font-size:10.5px; font-weight:600;
+  padding:3px 8px; border-radius:6px; letter-spacing:.02em;
+}
+.cur-track{ height:4px; border-radius:99px; background:rgba(255,255,255,.06); overflow:hidden; margin-top:12px; }
+.cur-fill{ height:100%; border-radius:99px; transition:width .55s cubic-bezier(.22,1,.36,1); }
+.cur-foot{
+  display:flex; justify-content:space-between; margin-top:8px;
+  font-family:var(--mono); font-size:9px; letter-spacing:.1em; text-transform:uppercase; color:var(--bs-mute);
+}
+
+/* ── Pair cards ─────────────────────────────────────── */
+.pair-card{
+  display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+  background:linear-gradient(120deg, var(--bs-surface2), var(--bs-surface));
+  border:1px solid var(--bs-border-soft); border-left:3px solid var(--bs-accent);
+  border-radius:12px; padding:13px 17px; margin-bottom:9px;
+  transition:border-color .18s ease, transform .18s ease;
+}
+.pair-card:hover{ transform:translateX(2px); }
+.pair-card.buy { border-left-color:var(--bs-up); }
+.pair-card.sell{ border-left-color:var(--bs-down); }
+.pair-name{ font-family:var(--mono); font-size:16px; font-weight:700; letter-spacing:.05em; min-width:110px; }
+.pair-tag{
+  font-family:var(--mono); font-size:10px; font-weight:700; letter-spacing:.1em;
+  padding:4px 12px; border-radius:6px;
+}
+.pair-tag.buy { color:#6EE7B7; background:rgba(16,185,129,.12); border:1px solid rgba(16,185,129,.35); }
+.pair-tag.sell{ color:#FDA4AF; background:rgba(244,63,94,.12);  border:1px solid rgba(244,63,94,.35); }
+.pair-metric{ font-family:var(--mono); font-size:10.5px; color:var(--bs-mute); letter-spacing:.06em; }
+.pair-metric b{ color:var(--bs-text); font-weight:600; }
+.pair-empty{
+  font-family:var(--mono); font-size:11.5px; color:var(--bs-mute); font-style:italic;
+  border:1px dashed var(--bs-border); border-radius:12px; padding:18px; text-align:center;
+}
+
+/* ── Legend ─────────────────────────────────────────── */
+.bs-legend{ display:flex; gap:16px; flex-wrap:wrap; align-items:center; margin:2px 0 10px 0; }
+.bs-legend span{ font-family:var(--mono); font-size:9.5px; color:var(--bs-mute); display:inline-flex; align-items:center; gap:6px; letter-spacing:.08em; }
+.bs-sw{ width:11px; height:11px; border-radius:3px; display:inline-block; }
+
+/* ── Sidebar ────────────────────────────────────────── */
+section[data-testid="stSidebar"]{
+  background:linear-gradient(180deg,#0D1117,#0A0C10);
+  border-right:1px solid var(--bs-border);
+}
+section[data-testid="stSidebar"] .block-container{ padding-top:1.6rem; }
+.sb-brand{
+  border:1px solid var(--bs-border); border-radius:12px; padding:13px 15px; margin-bottom:18px;
+  background:linear-gradient(140deg, rgba(76,141,255,.10), rgba(20,26,35,.6));
+}
+.sb-brand-t{ font-family:var(--mono); font-size:13px; font-weight:700; letter-spacing:.2em; color:var(--bs-text); }
+.sb-brand-s{ font-family:var(--mono); font-size:9px; color:var(--bs-mute); letter-spacing:.12em; margin-top:3px; text-transform:uppercase; }
+.sb-lbl{
+  font-family:var(--mono); font-size:9px; letter-spacing:.18em; text-transform:uppercase;
+  color:var(--bs-mute); margin:16px 0 6px 0;
+}
+
+/* ── Widgets ────────────────────────────────────────── */
+div[data-baseweb="select"] > div{
+  background:var(--bs-surface) !important; border:1px solid var(--bs-border) !important;
+  border-radius:9px !important; font-family:var(--mono) !important; font-size:12px !important;
+  color:var(--bs-text) !important;
+}
+div[data-baseweb="select"] > div:hover{ border-color:var(--bs-accent) !important; }
+.stDownloadButton button, .stButton button{
+  width:100%; background:var(--bs-surface2) !important; color:var(--bs-text) !important;
+  border:1px solid var(--bs-border) !important; border-radius:10px !important;
+  font-family:var(--mono) !important; font-size:11.5px !important; font-weight:600 !important;
+  letter-spacing:.06em !important; padding:.6rem 1rem !important; transition:all .18s ease !important;
+}
+.stDownloadButton button:hover, .stButton button:hover{
+  border-color:var(--bs-accent) !important; color:#fff !important;
+  background:linear-gradient(120deg, rgba(76,141,255,.18), var(--bs-surface2)) !important;
+  box-shadow:0 6px 20px rgba(76,141,255,.20) !important;
+}
+div[data-testid="stCaptionContainer"] p{
+  font-family:var(--mono) !important; font-size:9.5px !important; color:var(--bs-mute) !important;
+  letter-spacing:.03em !important;
+}
+div[data-testid="stAlert"]{
+  background:var(--bs-surface) !important; border:1px solid var(--bs-border) !important;
+  border-radius:10px !important; font-family:var(--mono) !important; font-size:11.5px !important;
+}
+div[data-testid="stStatusWidget"], details[data-testid="stExpander"]{
+  border-radius:10px !important; border-color:var(--bs-border) !important;
+}
+hr{ border-color:var(--bs-border-soft) !important; }
+iframe{ width:100% !important; border-radius:12px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -988,9 +1162,8 @@ INDICES = {
 }
 METAUX = {
     "XAU_USD":   "GOLD",
-    # "XAG_USD": "SILVER",  — retiré (peu pertinent pour l'analyse macro FX)
     "XPT_USD":   "PLATINUM",
-    "WTICO_USD": "WTI CRUDE",  # ajouté — signal macro risque/OPEC
+    "WTICO_USD": "WTI CRUDE",
 }
 
 FOREX_PAIRS = PAIRS
@@ -1017,7 +1190,7 @@ def _fetch_candles_cached(
 ) -> Optional[pd.DataFrame]:
     """Récupère les chandeliers avec cache."""
     access_token = st.secrets["OANDA_ACCESS_TOKEN"]
-    client = OandaClient(_create_client(access_token, environment))  # retry 429 identique au moteur
+    client = OandaClient(_create_client(access_token, environment))
     try:
         params = {"count": count, "granularity": granularity, "price": "M"}
         r = instruments.InstrumentsCandles(instrument=instrument, params=params)
@@ -1039,7 +1212,6 @@ def _fetch_candles_cached(
 
 def _smoothed_pct(closes: pd.Series, smooth: int = MAP_SMOOTH_WINDOW) -> Optional[float]:
     """
-    v10: optional smoothing for Market Map.
     smooth=1 -> legacy exact (single-tick change).
     smooth>=2 -> mean(last `smooth`) / mean(previous `smooth`) - 1.
     """
@@ -1072,7 +1244,7 @@ def fetch_market_map_data(
     }
     max_age = max_age_map.get(gran, pd.Timedelta(hours=1))
 
-    now_utc = pd.Timestamp.utcnow()  # hoisted — évite 28 appels redondants dans la boucle
+    now_utc = pd.Timestamp.utcnow()
     for pair in FOREX_PAIRS:
         df = _fetch_candles_cached(_token_fp, environment, pair, gran, 30)
         if df is None or len(df) < 2:
@@ -1108,66 +1280,160 @@ def fetch_market_map_data(
     return local_df_prices, local_pct_special, local_pair_changes
 
 
-# ── 3. Rendu cartes ───────────────────────────────────────────────────────────
+# ── 3. Composants UI ──────────────────────────────────────────────────────────
 
-def display_card(name: str, score: float, arrow_str: str) -> str:
-    """Génère la carte HTML d'une devise."""
-    safe_name = html.escape(name)
-
+def _score_palette(score: float) -> Tuple[str, str, str]:
+    """(couleur, gradient de barre, tier css) selon le score 0-10."""
     if score >= 7:
-        c_txt, c_bg = "text-green",  "bg-green"
-    elif score >= 5.5:
-        c_txt, c_bg = "text-blue",   "bg-blue"
-    elif score >= 4:
-        c_txt, c_bg = "text-orange", "bg-orange"
-    else:
-        c_txt, c_bg = "text-red",     "bg-red"
+        return T.UP,   "linear-gradient(90deg,#059669,#34D399)", "t-1"
+    if score >= 5.5:
+        return T.ACCENT, "linear-gradient(90deg,#2F6BD8,#6BA5FF)", "t-2"
+    if score >= 4:
+        return T.WARN, "linear-gradient(90deg,#B45309,#FBBF24)", "t-3"
+    return T.DOWN,     "linear-gradient(90deg,#BE123C,#FB7185)", "t-4"
+
+
+def display_card(
+    name: str,
+    score: float,
+    arrow_str: str,
+    rank: Optional[int] = None,
+    velocity: float = 0.0,
+) -> str:
+    """Génère la carte HTML d'une devise (design v10.1)."""
+    safe_name = html.escape(name)
+    color, bar_grad, tier = _score_palette(score)
 
     if arrow_str == "up":
-        arrow, a_col = "↗", "text-green"
+        arrow, v_col, v_bg = "▲", "#6EE7B7", "rgba(16,185,129,.12)"
+        v_lbl = "ACCÉLÈRE"
     elif arrow_str == "down":
-        arrow, a_col = "↘", "text-red"
+        arrow, v_col, v_bg = "▼", "#FDA4AF", "rgba(244,63,94,.12)"
+        v_lbl = "DÉCÉLÈRE"
     else:
-        arrow, a_col = "→", "text-gray"
+        arrow, v_col, v_bg = "▬", T.NEUTRAL, "rgba(148,163,184,.10)"
+        v_lbl = "STABLE"
 
     flag_code = FLAG_URLS.get(name, "xk")
-    img_html  = (
-        f'<img src="https://flagcdn.com/48x36/{html.escape(flag_code)}.png" '
-        f'style="width:24px; border-radius:2px;">'
+    img_html = (
+        f'<img class="cur-flag" alt="{safe_name}" '
+        f'src="https://flagcdn.com/48x36/{html.escape(flag_code)}.png">'
     )
+    rank_html = f'<span class="cur-rank">#{rank}</span>' if rank else ""
     bar_w = min(max(score * 10, 0), 100)
 
     return f"""
-    <div class="currency-card">
-        <div class="card-header">{img_html} <span class="asset-name">{safe_name}</span></div>
-        <div class="strength-score {c_txt}">
-            {score:.1f} <span class="velocity-arrow {a_col}">{arrow}</span>
-        </div>
-        <div class="progress-bg">
-            <div class="progress-fill {c_bg}" style="width:{bar_w}%;"></div>
-        </div>
+    <div class="cur-card {tier}">
+      <div class="cur-top">
+        {img_html}
+        <span class="cur-code">{safe_name}</span>
+        {rank_html}
+      </div>
+      <div class="cur-score" style="color:{color};">
+        {score:.1f}<span class="cur-max">/10</span>
+        <span class="cur-vel" style="color:{v_col};background:{v_bg};">{arrow} {velocity:+.3f}</span>
+      </div>
+      <div class="cur-track"><div class="cur-fill" style="width:{bar_w}%;background:{bar_grad};"></div></div>
+      <div class="cur-foot"><span>Force relative</span><span>{v_lbl}</span></div>
     </div>
     """
+
+
+def section_title(title: str, caption: str = "") -> str:
+    """En-tête de section stylisé."""
+    cap = f'<div class="bs-sec-c">{html.escape(caption)}</div>' if caption else ""
+    return (
+        f'<div class="bs-sec"><div class="bs-sec-bar"></div>'
+        f'<div class="bs-sec-t">{html.escape(title)}</div>{cap}'
+        f'<div class="bs-sec-line"></div></div>'
+    )
+
+
+def kpi_tile(label: str, value: str, sub: str = "", color: str = T.TEXT) -> str:
+    """Tuile KPI."""
+    sub_html = f'<div class="bs-kpi-s">{html.escape(sub)}</div>' if sub else ""
+    return (
+        f'<div class="bs-kpi"><div class="bs-kpi-l">{html.escape(label)}</div>'
+        f'<div class="bs-kpi-v" style="color:{color};">{html.escape(value)}</div>'
+        f'{sub_html}</div>'
+    )
+
+
+def app_header(env: str, gran: str, regime: str, ts: str) -> str:
+    """Bandeau d'en-tête de l'application."""
+    regime_style = {
+        "RISK_ON":  ("RISK ON", "on"),
+        "RISK_OFF": ("RISK OFF", "off"),
+        "NEUTRAL":  ("NEUTRE", "neu"),
+    }
+    r_lbl, r_cls = regime_style.get(regime, regime_style["NEUTRAL"])
+    return f"""
+    <div class="bs-header">
+      <div class="bs-brand">
+        <div class="bs-logo">◆</div>
+        <div>
+          <div class="bs-eyebrow">Bluestar System</div>
+          <div class="bs-title">Market Dashboard</div>
+          <div class="bs-sub">FX Institutional Desk · Strength Engine v10.1 · W / D / H4 / H1</div>
+        </div>
+      </div>
+      <div class="bs-headmeta">
+        <span class="bs-chip {r_cls}"><span class="bs-dot"></span>{r_lbl}</span>
+        <span class="bs-chip">ENV · {html.escape(env.upper())}</span>
+        <span class="bs-chip">MAP · {html.escape(gran)}</span>
+        <span class="bs-chip">{html.escape(ts)}</span>
+      </div>
+    </div>
+    """
+
+
+def pair_card_html(item: Dict) -> str:
+    """Carte d'une paire sélectionnée."""
+    direction = item.get("direction", "")
+    pair_name = item.get("exec_pair", item.get("pair", ""))
+    diff      = item.get("diff", 0.0)
+    atr       = item.get("atr")
+    is_buy    = direction == "BUY"
+    cls       = "buy" if is_buy else "sell"
+    lbl       = "▲ LONG" if is_buy else "▼ SHORT"
+    atr_str   = f"{atr:.4f}%" if atr else "N/A"
+    return (
+        f'<div class="pair-card {cls}">'
+        f'<div class="pair-name">{html.escape(pair_name)}</div>'
+        f'<div class="pair-tag {cls}">{lbl}</div>'
+        f'<div class="pair-metric">DIFF <b>{diff:.2f}</b></div>'
+        f'<div class="pair-metric">ATR H1 <b>{atr_str}</b></div>'
+        f'<div class="pair-metric" style="margin-left:auto;">EXEC · OANDA</div>'
+        f'</div>'
+    )
 
 
 # ── 4. Market Map HTML ────────────────────────────────────────────────────────
 
 def _get_bg_color(pct: float) -> str:
-    """Couleur de fond selon le pourcentage."""
+    """Couleur de fond selon le pourcentage (heatmap dark theme)."""
     if pct >= 0.15:
-        return "#009900"
+        return "#0E9F6E"
     if pct >= 0.01:
-        return "#33cc33"
+        return "rgba(16,185,129,.16)"
     if pct <= -0.15:
-        return "#cc0000"
+        return "#D8304F"
     if pct <= -0.01:
-        return "#ff3300"
-    return "#f0f0f0"
+        return "rgba(244,63,94,.16)"
+    return "rgba(148,163,184,.08)"
 
 
 def _get_text_color(pct: float) -> str:
     """Couleur du texte selon le pourcentage."""
-    return "#333" if -0.01 < pct < 0.01 else "white"
+    if pct >= 0.15:
+        return "#EAFFF6"
+    if pct >= 0.01:
+        return "#6EE7B7"
+    if pct <= -0.15:
+        return "#FFF1F3"
+    if pct <= -0.01:
+        return "#FDA4AF"
+    return "#94A3B8"
 
 
 def _render_forex_section(
@@ -1175,7 +1441,7 @@ def _render_forex_section(
     sorted_cols: List[str],
 ) -> str:
     """HTML pour la section Forex."""
-    html_out = '<div class="section-header">💱 FOREX MAP</div>'
+    html_out = '<div class="section-header"><span class="sh-bar"></span>Forex Heatmap</div>'
     html_out += '<div class="matrix-row">'
     for currency in sorted_cols:
         items   = forex_data[currency]
@@ -1195,13 +1461,13 @@ def _render_forex_section(
             html_out += (
                 f'<div class="tile" style="background:{col};color:{txt};">'
                 f'<span>{html.escape(x["pair"])}</span>'
-                f'<span>+{x["pct"]:.2f}%</span></div>'
+                f'<span class="val">+{x["pct"]:.2f}</span></div>'
             )
         html_out += f'<div class="sep">{html.escape(currency)}</div>'
         for x in flat:
             html_out += (
-                f'<div class="tile" style="background:#f0f0f0;color:#333;">'
-                f'<span>{html.escape(x["pair"])}</span><span>unch</span></div>'
+                f'<div class="tile" style="background:rgba(148,163,184,.08);color:#94A3B8;">'
+                f'<span>{html.escape(x["pair"])}</span><span class="val">—</span></div>'
             )
         for x in losers:
             col = _get_bg_color(x["pct"])
@@ -1209,7 +1475,7 @@ def _render_forex_section(
             html_out += (
                 f'<div class="tile" style="background:{col};color:{txt};">'
                 f'<span>{html.escape(x["pair"])}</span>'
-                f'<span>{x["pct"]:.2f}%</span></div>'
+                f'<span class="val">{x["pct"]:.2f}</span></div>'
             )
         html_out += '</div>'
     html_out += '</div>'
@@ -1222,16 +1488,19 @@ def _render_special_section(
     title: str,
 ) -> str:
     """HTML pour une section spéciale (indices ou métaux)."""
-    html_out = f'<div class="section-header">{title}</div>'
+    html_out = f'<div class="section-header"><span class="sh-bar"></span>{title}</div>'
     html_out += '<div class="grid-container">'
     for name, data in special_data.items():
         if data["cat"] != category:
             continue
-        pct = data["pct"]
+        pct  = data["pct"]
+        bg   = _get_bg_color(pct)
+        fg   = _get_text_color(pct)
+        sign = "+" if pct >= 0 else ""
         html_out += (
-            f'<div class="big-box" style="background:{_get_bg_color(pct)}">'
+            f'<div class="big-box" style="background:{bg};color:{fg};">'
             f'<span class="box-name">{html.escape(name)}</span>'
-            f'<span class="box-val">{pct:+.2f}%</span></div>'
+            f'<span class="box-val">{sign}{pct:.2f}%</span></div>'
         )
     html_out += '</div>'
     return html_out
@@ -1241,9 +1510,12 @@ def generate_exact_map_html(
     local_pair_changes: Dict[str, float],
     local_pct_special: Dict,
 ) -> str:
-    """Génère la Market Map HTML."""
+    """Génère la Market Map HTML (design v10.1, dark)."""
     if not local_pair_changes:
-        return "<p style='color:#aaa;padding:1rem;'>Données insuffisantes.</p>"
+        return (
+            "<p style='color:#657084;padding:1rem;font-family:monospace;font-size:12px;'>"
+            "Données insuffisantes.</p>"
+        )
 
     forex_data = {c: [] for c in CURRENCIES}
     for pair, pct in local_pair_changes.items():
@@ -1259,43 +1531,53 @@ def generate_exact_map_html(
     scores      = {c: sum(x["pct"] for x in items) for c, items in forex_data.items()}
     sorted_cols = sorted(scores, key=scores.get, reverse=True)
 
-    html_out = """<!DOCTYPE html><html><head><style>
-    body { font-family: Arial,sans-serif; background-color: transparent; margin: 0; padding: 0; }
-    .section-header {
-        color: #aaa; font-size: 14px; font-weight: bold; text-transform: uppercase;
-        margin: 25px 0 10px 0; display: flex; align-items: center; gap: 5px;
-        border-bottom: 2px solid #333; padding-bottom: 5px;
+    html_out = """<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&display=swap');
+    *{box-sizing:border-box;}
+    body{
+      font-family:'JetBrains Mono',ui-monospace,monospace;
+      background:transparent; margin:0; padding:2px 0 12px 0; color:#E6EAF2;
     }
-    .matrix-row { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 10px; }
-    .currency-col { display: flex; flex-direction: column; min-width: 95px; gap: 1px; }
-    .tile {
-        display: flex; justify-content: space-between; align-items: center;
-        padding: 3px 6px; font-size: 11px; font-weight: bold;
-        box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+    .section-header{
+      display:flex; align-items:center; gap:9px;
+      color:#9AA6B8; font-size:10px; font-weight:700; text-transform:uppercase;
+      letter-spacing:.18em; margin:20px 0 10px 0; padding-bottom:7px;
+      border-bottom:1px solid #232C39;
     }
-    .sep {
-        background: #eee; color: #000; font-weight: 900;
-        padding: 5px; margin: 2px 0; font-size: 13px;
-        text-transform: uppercase; border-left: 4px solid #333;
+    .section-header:first-child{ margin-top:0; }
+    .sh-bar{ width:3px; height:12px; border-radius:2px; background:linear-gradient(180deg,#4C8DFF,#1E3FA8); }
+    .matrix-row{ display:flex; gap:6px; overflow-x:auto; padding-bottom:8px; }
+    .currency-col{ display:flex; flex-direction:column; min-width:102px; gap:2px; }
+    .tile{
+      display:flex; justify-content:space-between; align-items:center; gap:6px;
+      padding:5px 9px; font-size:10.5px; font-weight:600; letter-spacing:.06em;
+      border-radius:5px; border:1px solid rgba(255,255,255,.05);
     }
-    .grid-container { display: flex; flex-wrap: wrap; gap: 10px; }
-    .big-box {
-        width: 140px; height: 60px;
-        display: flex; flex-direction: column; justify-content: center; align-items: center;
-        color: white; border-radius: 4px;
-        box-shadow: 0 3px 5px rgba(0,0,0,0.3);
-        text-shadow: 1px 1px 2px rgba(0,0,0,0.5);
+    .tile .val{ font-variant-numeric:tabular-nums; font-weight:700; }
+    .sep{
+      background:linear-gradient(120deg,#1E2938,#141A23); color:#E6EAF2;
+      font-weight:800; letter-spacing:.2em; padding:7px 9px; margin:4px 0;
+      font-size:11.5px; text-transform:uppercase; text-align:center;
+      border-radius:6px; border:1px solid #2B3646; border-top:2px solid #4C8DFF;
     }
-    .box-name { font-size: 11px; font-weight: bold; margin-bottom: 2px; text-transform: uppercase; }
-    .box-val  { font-size: 14px; font-weight: 900; }
+    .grid-container{ display:flex; flex-wrap:wrap; gap:9px; }
+    .big-box{
+      min-width:148px; height:66px; display:flex; flex-direction:column;
+      justify-content:center; align-items:center; gap:5px;
+      border-radius:10px; border:1px solid rgba(255,255,255,.06);
+    }
+    .box-name{ font-size:9.5px; font-weight:600; letter-spacing:.16em; text-transform:uppercase; opacity:.85; }
+    .box-val{ font-size:19px; font-weight:800; letter-spacing:-.02em; font-variant-numeric:tabular-nums; }
+    ::-webkit-scrollbar{ height:7px; }
+    ::-webkit-scrollbar-track{ background:transparent; }
+    ::-webkit-scrollbar-thumb{ background:#26303E; border-radius:6px; }
     </style></head><body>"""
 
     html_out += _render_forex_section(forex_data, sorted_cols)
-    html_out += _render_special_section(local_pct_special, "INDICES", "📊 INDICES")
-    html_out += _render_special_section(local_pct_special, "METAUX", "🛢️ COMMODITÉS")
+    html_out += _render_special_section(local_pct_special, "INDICES", "Indices Actions")
+    html_out += _render_special_section(local_pct_special, "METAUX", "Commodités")
     html_out += '</body></html>'
     return html_out
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1315,11 +1597,7 @@ def _session_label() -> str:
 
 
 def _infer_regime(pct_special: Dict) -> str:
-    """
-    Infère le régime risk-on/off depuis indices OANDA + WTI + Gold.
-    Logique : equity average > 0.10 et gold stable = RISK_ON.
-              equity < -0.10 ou gold > 0.20 avec indices négatifs = RISK_OFF.
-    """
+    """Infère le régime risk-on/off depuis indices OANDA + WTI + Gold."""
     indices_pcts = [d["pct"] for d in pct_special.values() if d["cat"] == "INDICES"]
     gold_pct     = pct_special.get("GOLD",      {}).get("pct", 0.0)
     wti_pct      = pct_special.get("WTI CRUDE", {}).get("pct", 0.0)
@@ -1342,21 +1620,12 @@ def generate_json_export(
     pct_special: Dict,
     granularity: str,
 ) -> str:
-    """
-    JSON structuré pour BLUESTAR_MACRO_BRIEFING_PROMPT.
-
-    Structure :
-      oanda_data       — tout ce que OANDA v20 fournit (force devises + market map)
-      external_required — champs null à remplir via source externe avant injection LLM
-      health           — état des données
-    """
+    """JSON structuré pour BLUESTAR_MACRO_BRIEFING_PROMPT."""
     now = datetime.datetime.now()
 
-    # Reverse-map symbol → name for JSON symbol field
     sym_to_name = {**INDICES, **METAUX}
     name_to_sym = {v: k for k, v in sym_to_name.items()}
 
-    # Indices / commodités séparés
     indices_out: Dict     = {}
     commodities_out: Dict = {}
     for name, data in pct_special.items():
@@ -1364,7 +1633,6 @@ def generate_json_export(
         entry = {"pct_change": round(data["pct"], 4), "symbol": sym}
         (indices_out if data["cat"] == "INDICES" else commodities_out)[name] = entry
 
-    # Velocity labels
     vel_label = {}
     for c, v in result.velocity.items():
         if v > 0.02:
@@ -1374,12 +1642,10 @@ def generate_json_export(
         else:
             vel_label[c] = "→ stable"
 
-    # USD context
     usd_score = result.scores_display.get("USD", 5.0)
     usd_rank  = (result.ranking.index("USD") + 1) if "USD" in result.ranking else None
     usd_bias  = "fort" if usd_score >= 6.5 else ("faible" if usd_score <= 3.5 else "neutre")
 
-    # Equity bias
     idx_pctsL = [d["pct"] for d in pct_special.values() if d["cat"] == "INDICES"]
     if idx_pctsL:
         avg_eq = sum(idx_pctsL) / len(idx_pctsL)
@@ -1394,7 +1660,7 @@ def generate_json_export(
             "timestamp":     now.isoformat(timespec="seconds"),
             "session":       _session_label(),
             "timeframe_map": granularity,
-            "system":        "BLUESTAR v10.0",
+            "system":        "BLUESTAR v10.1",
         },
         "oanda_data": {
             "currency_strength": {
@@ -1456,10 +1722,7 @@ def generate_briefing_html(
     pct_special: Dict,
     granularity: str,
 ) -> str:
-    """
-    HTML institutionnel auto-peuplé depuis OANDA.
-    Compatible WeasyPrint (print-ready, système de couleurs BLUESTAR).
-    """
+    """HTML institutionnel auto-peuplé depuis OANDA (design épuré, print-ready)."""
     now      = datetime.datetime.now()
     date_str = now.strftime("%d/%m/%Y")
     time_str = now.strftime("%H:%M")
@@ -1469,28 +1732,29 @@ def generate_briefing_html(
     cov_pct  = int(hc.get("coverage_min", 0) * 100)
 
     regime_map = {
-        "RISK_ON":  ("🟢 RISK ON",       "#1a7a4a", "#e8f5ee"),
-        "RISK_OFF": ("🔴 RISK OFF",      "#c0292a", "#fdecea"),
-        "NEUTRAL":  ("🟡 NEUTRE / MIXTE", "#1B45B4", "#E8EEFF"),
+        "RISK_ON":  ("RISK ON",        "#047857", "#ECFDF5", "#A7F3D0"),
+        "RISK_OFF": ("RISK OFF",       "#BE123C", "#FFF1F2", "#FECDD3"),
+        "NEUTRAL":  ("NEUTRE / MIXTE", "#1D4ED8", "#EFF6FF", "#BFDBFE"),
     }
-    regime_label, r_col, r_bg = regime_map.get(regime, regime_map["NEUTRAL"])
-    cov_col = "#1a7a4a" if cov_pct >= 80 else "#c0292a"
+    regime_label, r_col, r_bg, r_bd = regime_map.get(regime, regime_map["NEUTRAL"])
+    cov_col = "#047857" if cov_pct >= 80 else "#BE123C"
 
     # ── Currency strength rows ────────────────────────────────────────────────
     rows_html = ""
     for i, cur in enumerate(result.ranking):
         score = result.scores_display.get(cur, 5.0)
         vel   = result.velocity.get(cur, 0.0)
-        arrow, a_col = ("↗", "#1a7a4a") if vel > 0.02 else (("↘", "#c0292a") if vel < -0.02 else ("→", "#6B89D8"))
-        s_col = "#1a7a4a" if score >= 7.0 else ("#1B45B4" if score >= 5.5 else ("#b5620a" if score >= 4.0 else "#c0292a"))
-        row_bg = "#f0f3fa" if i % 2 == 0 else "#ffffff"
+        arrow, a_col = ("▲", "#047857") if vel > 0.02 else (("▼", "#BE123C") if vel < -0.02 else ("▬", "#94A3B8"))
+        s_col = "#047857" if score >= 7.0 else ("#1D4ED8" if score >= 5.5 else ("#B45309" if score >= 4.0 else "#BE123C"))
+        bar_w = min(max(score * 10, 0), 100)
         rows_html += (
-            f'<tr style="background:{row_bg};">'
-            f'<td style="text-align:center;font-weight:700;color:#6B89D8;width:40px;">{i+1}</td>'
-            f'<td style="font-weight:800;font-family:var(--mono);color:#0d1f4e;letter-spacing:.05em;">{html.escape(cur)}</td>'
-            f'<td style="text-align:center;font-weight:800;font-family:var(--mono);color:{s_col};font-size:15px;">{score:.2f}</td>'
-            f'<td style="text-align:center;font-weight:700;color:{a_col};font-family:var(--mono);">'
-            f'{arrow} <span style="font-size:10px;">{vel:+.4f}</span></td>'
+            f'<tr>'
+            f'<td class="rk">{i+1}</td>'
+            f'<td class="cur">{html.escape(cur)}</td>'
+            f'<td class="num" style="color:{s_col};">{score:.2f}</td>'
+            f'<td class="barcell">'
+            f'<div class="bar"><div class="bar-f" style="width:{bar_w}%;background:{s_col};"></div></div></td>'
+            f'<td class="num" style="color:{a_col};">{arrow} <span class="sm">{vel:+.4f}</span></td>'
             f'</tr>'
         )
 
@@ -1501,75 +1765,59 @@ def generate_briefing_html(
         pair_name = item.get("exec_pair", item.get("pair", ""))
         diff      = item.get("diff", 0.0)
         atr       = item.get("atr")
-        d_col, d_bg, d_lbl = (
-            ("#1a7a4a", "#e8f5ee", "↑ LONG")
-            if direction == "BUY"
-            else ("#c0292a", "#fdecea", "↓ SHORT")
+        is_buy    = direction == "BUY"
+        d_col, d_bg, d_bd, d_lbl = (
+            ("#047857", "#ECFDF5", "#A7F3D0", "▲ LONG") if is_buy
+            else ("#BE123C", "#FFF1F2", "#FECDD3", "▼ SHORT")
         )
         atr_str = f"{atr:.4f}%" if atr else "N/A"
         pairs_html += (
-            f'<div style="display:flex;align-items:center;gap:12px;background:#f0f3fa;'
-            f'border:1px solid #dde3f5;border-radius:6px;padding:10px 14px;margin-bottom:8px;">'
-            f'<div style="font-family:var(--mono);font-size:16px;font-weight:800;color:#0d1f4e;min-width:90px;">'
-            f'{html.escape(pair_name)}</div>'
-            f'<div style="background:{d_bg};border:1px solid {d_col};border-radius:4px;'
-            f'padding:3px 12px;font-family:var(--mono);font-size:11px;font-weight:700;color:{d_col};">'
-            f'{d_lbl}</div>'
-            f'<div style="font-family:var(--mono);font-size:11px;color:#3a4a7a;">'
-            f'Force diff: <strong>{diff:.2f}</strong></div>'
-            f'<div style="font-family:var(--mono);font-size:11px;color:#3a4a7a;">'
-            f'ATR: <strong>{atr_str}</strong></div>'
+            f'<div class="pairrow" style="border-left-color:{d_col};">'
+            f'<div class="pairname">{html.escape(pair_name)}</div>'
+            f'<div class="pairtag" style="color:{d_col};background:{d_bg};border-color:{d_bd};">{d_lbl}</div>'
+            f'<div class="pairm">Force diff <b>{diff:.2f}</b></div>'
+            f'<div class="pairm">ATR H1 <b>{atr_str}</b></div>'
             f'</div>'
         )
     if not pairs_html:
         pairs_html = (
-            '<div style="color:#6B89D8;font-style:italic;padding:12px;font-family:var(--mono);">'
-            'Aucune paire sélectionnée — vérifier la couverture des données.</div>'
+            '<div class="empty">Aucune paire sélectionnée — vérifier la couverture des données.</div>'
         )
 
     # ── Market snapshot ───────────────────────────────────────────────────────
     def _tile(name: str, pct: float) -> str:
-        if pct >= 0.15:   bg, fg = "#009900", "white"
-        elif pct >= 0.01: bg, fg = "#33cc33", "white"
-        elif pct <= -0.15: bg, fg = "#cc0000", "white"
-        elif pct <= -0.01: bg, fg = "#ff3300", "white"
-        else:              bg, fg = "#f0f3fa", "#444"
+        if pct >= 0.15:
+            bg, fg, bd = "#ECFDF5", "#047857", "#A7F3D0"
+        elif pct >= 0.01:
+            bg, fg, bd = "#F6FEFA", "#059669", "#D1FAE5"
+        elif pct <= -0.15:
+            bg, fg, bd = "#FFF1F2", "#BE123C", "#FECDD3"
+        elif pct <= -0.01:
+            bg, fg, bd = "#FFF7F8", "#E11D48", "#FEE2E4"
+        else:
+            bg, fg, bd = "#F8FAFC", "#64748B", "#E2E8F0"
         sign = "+" if pct >= 0 else ""
         return (
-            f'<div style="background:{bg};color:{fg};border-radius:6px;'
-            f'padding:12px 16px;min-width:120px;text-align:center;">'
-            f'<div style="font-family:var(--mono);font-size:9px;font-weight:700;'
-            f'text-transform:uppercase;margin-bottom:4px;">{html.escape(name)}</div>'
-            f'<div style="font-family:var(--mono);font-size:20px;font-weight:800;">'
-            f'{sign}{pct:.2f}%</div></div>'
+            f'<div class="tile" style="background:{bg};border-color:{bd};">'
+            f'<div class="tile-n">{html.escape(name)}</div>'
+            f'<div class="tile-v" style="color:{fg};">{sign}{pct:.2f}%</div></div>'
         )
 
-    indices_tiles    = "".join(_tile(n, d["pct"]) for n, d in pct_special.items() if d["cat"] == "INDICES")
-    commodity_tiles  = "".join(_tile(n, d["pct"]) for n, d in pct_special.items() if d["cat"] == "METAUX")
+    indices_tiles   = "".join(_tile(n, d["pct"]) for n, d in pct_special.items() if d["cat"] == "INDICES")
+    commodity_tiles = "".join(_tile(n, d["pct"]) for n, d in pct_special.items() if d["cat"] == "METAUX")
 
     snap_html = (
-        f'<div style="margin-bottom:8px;font-family:var(--mono);font-size:9px;color:#6B89D8;'
-        f'letter-spacing:1px;font-weight:700;text-transform:uppercase;">📊 INDICES</div>'
-        f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;">{indices_tiles}</div>'
-        f'<div style="margin-bottom:8px;font-family:var(--mono);font-size:9px;color:#6B89D8;'
-        f'letter-spacing:1px;font-weight:700;text-transform:uppercase;">🛢️ COMMODITÉS</div>'
-        f'<div style="display:flex;flex-wrap:wrap;gap:8px;">{commodity_tiles}</div>'
+        f'<div class="minihdr">Indices Actions</div>'
+        f'<div class="tilewrap">{indices_tiles}</div>'
+        f'<div class="minihdr" style="margin-top:16px;">Commodités</div>'
+        f'<div class="tilewrap">{commodity_tiles}</div>'
     )
 
     # ── External placeholders ─────────────────────────────────────────────────
-    ext_kpis = [
-        ("VIX",   "CBOE"),
-        ("DXY",   "ICE"),
-        ("US10Y", "FRED"),
-        ("MOVE",  "ICE"),
-    ]
+    ext_kpis = [("VIX", "CBOE"), ("DXY", "ICE"), ("US10Y", "FRED"), ("MOVE", "ICE")]
     ext_html = "".join(
-        f'<div style="background:#f0f3fa;border:1px solid #dde3f5;border-radius:6px;'
-        f'padding:12px 16px;min-width:110px;text-align:center;border-top:2px solid #1B45B4;">'
-        f'<div style="font-size:8px;color:#6B89D8;text-transform:uppercase;letter-spacing:1px;'
-        f'font-weight:600;font-family:var(--mono);margin-bottom:4px;">{label}</div>'
-        f'<div style="font-size:22px;font-weight:700;font-family:var(--mono);color:#bbc6e8;">—</div>'
-        f'<div style="font-size:9px;color:#6B89D8;">{src} requis</div></div>'
+        f'<div class="ext"><div class="ext-l">{label}</div>'
+        f'<div class="ext-v">—</div><div class="ext-s">{src} requis</div></div>'
         for label, src in ext_kpis
     )
 
@@ -1580,85 +1828,137 @@ def generate_briefing_html(
 <meta charset="UTF-8">
 <title>Macro Briefing BLUESTAR — {html.escape(date_str)}</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Inter:wght@300;400;500;600;700&display=swap');
 :root{{
-  --royal:#1B45B4;--royal-dim:#6B89D8;--bg:#f5f7fc;--white:#fff;--card:#f0f3fa;
-  --dark:#0d1f4e;--sec:#3a4a7a;--muted:#6B89D8;--border:#dde3f5;--border2:#bbc6e8;
-  --mono:'IBM Plex Mono','Courier New',monospace;--sans:'IBM Plex Sans',system-ui,sans-serif;
+  --ink:#0F172A; --ink2:#334155; --muted:#64748B; --line:#E2E8F0; --line2:#CBD5E1;
+  --bg:#FFFFFF; --soft:#F8FAFC; --royal:#1D4ED8; --royal-dim:#93B4FF;
+  --mono:'JetBrains Mono','Courier New',monospace; --sans:'Inter',system-ui,sans-serif;
 }}
 *{{margin:0;padding:0;box-sizing:border-box}}
-body{{background:var(--bg);color:var(--dark);font-family:var(--sans);font-size:12px;line-height:1.5}}
-#page{{max-width:1100px;margin:0 auto;padding:16px}}
-.section{{background:var(--white);border:1px solid var(--border);border-radius:8px;margin-bottom:14px;overflow:hidden}}
-.sec-hdr{{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border)}}
-.sec-num{{width:24px;height:24px;border-radius:50%;background:var(--royal);color:#fff;font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;font-family:var(--mono);flex-shrink:0}}
-.sec-ttl{{font-size:12px;font-weight:700;color:var(--dark);text-transform:uppercase;letter-spacing:.5px;font-family:var(--mono)}}
-.sec-body{{padding:14px 16px}}
+body{{background:#F1F5F9;color:var(--ink);font-family:var(--sans);font-size:12px;line-height:1.55;-webkit-font-smoothing:antialiased}}
+#page{{max-width:1080px;margin:0 auto;padding:20px}}
+
+.hdr{{display:flex;align-items:center;justify-content:space-between;gap:20px;background:var(--bg);
+     border:1px solid var(--line);border-radius:14px 14px 0 0;padding:18px 26px}}
+.hdr-l{{display:flex;align-items:center;gap:14px}}
+.logo{{width:38px;height:38px;border-radius:10px;background:linear-gradient(140deg,#2563EB,#1E3A8A);
+      display:flex;align-items:center;justify-content:center;color:#fff;font-size:17px}}
+.eyebrow{{font-family:var(--mono);font-size:8.5px;letter-spacing:.3em;color:var(--royal);font-weight:700;text-transform:uppercase}}
+.h1{{font-size:19px;font-weight:700;letter-spacing:-.03em;line-height:1.15;color:var(--ink)}}
+.h1s{{font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:2px}}
+.hdr-r{{text-align:right;border-left:1px solid var(--line);padding-left:18px}}
+.hdr-r1{{font-family:var(--mono);font-size:10.5px;font-weight:700;letter-spacing:.1em;color:var(--royal);text-transform:uppercase}}
+.hdr-r2{{font-family:var(--mono);font-size:8.5px;color:var(--muted);margin-top:4px}}
+
+.subbar{{background:var(--soft);border:1px solid var(--line);border-top:none;border-radius:0 0 14px 14px;
+        padding:8px 26px;display:flex;align-items:center;gap:22px;font-family:var(--mono);font-size:9.5px;
+        color:var(--ink2);margin-bottom:14px;letter-spacing:.04em}}
+.conf{{margin-left:auto;font-weight:700;color:var(--royal);background:#EFF6FF;border:1px solid #BFDBFE;
+      padding:2px 11px;border-radius:99px;font-size:8.5px;letter-spacing:.14em}}
+
+.section{{background:var(--bg);border:1px solid var(--line);border-radius:12px;margin-bottom:12px;overflow:hidden}}
+.sec-hdr{{display:flex;align-items:center;gap:11px;padding:11px 18px;border-bottom:1px solid var(--line);background:var(--soft)}}
+.sec-num{{width:22px;height:22px;border-radius:6px;background:var(--royal);color:#fff;font-size:9.5px;font-weight:700;
+         display:flex;align-items:center;justify-content:center;font-family:var(--mono);flex-shrink:0}}
+.sec-ttl{{font-size:11px;font-weight:700;color:var(--ink);text-transform:uppercase;letter-spacing:.14em;font-family:var(--mono)}}
+.sec-body{{padding:16px 18px}}
+
+.banner{{display:flex;align-items:center;gap:12px;background:var(--soft);border:1px solid var(--line);
+        border-radius:9px;padding:11px 15px;margin-bottom:15px;flex-wrap:wrap}}
+.banner-l{{font-family:var(--mono);font-size:8.5px;color:var(--muted);letter-spacing:.18em;text-transform:uppercase}}
+.regime{{font-family:var(--mono);font-size:12px;font-weight:700;padding:3px 13px;border-radius:6px;border:1px solid}}
+.banner-r{{margin-left:auto;font-family:var(--mono);font-size:9.5px;color:var(--muted);letter-spacing:.04em}}
+
 table{{width:100%;border-collapse:collapse;font-size:12px}}
-thead tr{{background:var(--royal)}}
-thead th{{padding:8px 12px;text-align:left;font-size:9px;font-weight:700;color:#fff;letter-spacing:1px;text-transform:uppercase;font-family:var(--mono)}}
-tbody td{{padding:7px 12px;vertical-align:middle;border-bottom:1px solid var(--border)}}
-.page-header{{background:linear-gradient(135deg,#F8FAFF,#F0F4FE);border:1px solid var(--border);border-radius:8px 8px 0 0;display:flex;align-items:center;justify-content:space-between;padding:14px 24px}}
-.page-subbar{{background:rgba(27,69,180,.04);border:1px solid var(--border);border-top:none;padding:7px 24px;display:flex;align-items:center;gap:24px;font-size:10px;font-family:var(--mono);color:var(--sec);margin-bottom:14px}}
-.footer{{text-align:center;font-family:var(--mono);font-size:8px;color:var(--muted);border-top:1px solid var(--border);padding:10px;margin-top:4px;letter-spacing:1.5px}}
-#pdf-fab{{position:fixed;bottom:24px;right:24px;z-index:9999}}
-#pdf-fab button{{background:#1B45B4;color:#fff;border:none;padding:10px 18px;border-radius:8px;font-family:var(--mono);font-size:12px;font-weight:700;cursor:pointer;box-shadow:0 4px 16px rgba(27,69,180,.4)}}
+thead th{{padding:8px 12px;text-align:left;font-size:8.5px;font-weight:700;color:var(--muted);
+         letter-spacing:.18em;text-transform:uppercase;font-family:var(--mono);border-bottom:1px solid var(--line2)}}
+tbody td{{padding:8px 12px;vertical-align:middle;border-bottom:1px solid var(--line)}}
+tbody tr:last-child td{{border-bottom:none}}
+td.rk{{width:34px;text-align:center;font-family:var(--mono);font-size:10px;font-weight:700;color:var(--royal-dim)}}
+td.cur{{font-family:var(--mono);font-weight:700;letter-spacing:.14em;color:var(--ink);width:80px}}
+td.num{{font-family:var(--mono);font-weight:700;font-size:13px;text-align:center;width:110px;font-variant-numeric:tabular-nums}}
+td.num .sm{{font-size:9px;font-weight:500}}
+td.barcell{{padding-right:22px}}
+.bar{{height:5px;border-radius:99px;background:#EEF2F7;overflow:hidden}}
+.bar-f{{height:100%;border-radius:99px}}
+
+.pairrow{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--soft);border:1px solid var(--line);
+         border-left:3px solid var(--royal);border-radius:9px;padding:11px 15px;margin-bottom:8px}}
+.pairname{{font-family:var(--mono);font-size:15px;font-weight:700;letter-spacing:.05em;min-width:105px;color:var(--ink)}}
+.pairtag{{font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.12em;padding:3px 12px;border-radius:5px;border:1px solid}}
+.pairm{{font-family:var(--mono);font-size:9.5px;color:var(--muted);letter-spacing:.06em}}
+.pairm b{{color:var(--ink);font-weight:700}}
+.empty{{font-family:var(--mono);font-size:10.5px;color:var(--muted);font-style:italic;text-align:center;
+       padding:18px;border:1px dashed var(--line2);border-radius:9px}}
+
+.minihdr{{font-family:var(--mono);font-size:8.5px;color:var(--muted);letter-spacing:.2em;font-weight:700;
+         text-transform:uppercase;margin-bottom:9px}}
+.tilewrap{{display:flex;flex-wrap:wrap;gap:8px}}
+.tile{{border:1px solid;border-radius:9px;padding:11px 16px;min-width:132px;text-align:center}}
+.tile-n{{font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:5px}}
+.tile-v{{font-family:var(--mono);font-size:18px;font-weight:800;letter-spacing:-.02em;font-variant-numeric:tabular-nums}}
+
+.ext{{background:var(--soft);border:1px solid var(--line);border-top:2px solid var(--royal);border-radius:9px;
+     padding:11px 16px;min-width:112px;text-align:center}}
+.ext-l{{font-family:var(--mono);font-size:8px;color:var(--muted);letter-spacing:.18em;text-transform:uppercase;font-weight:700;margin-bottom:4px}}
+.ext-v{{font-family:var(--mono);font-size:20px;font-weight:700;color:var(--line2)}}
+.ext-s{{font-family:var(--mono);font-size:8px;color:var(--muted);margin-top:2px}}
+.note{{font-family:var(--mono);font-size:9.5px;color:var(--muted);background:var(--soft);border:1px solid var(--line);
+      border-radius:9px;padding:11px 15px;line-height:1.7}}
+.note code{{background:#EFF6FF;color:var(--royal);padding:1px 5px;border-radius:4px}}
+
+.footer{{text-align:center;font-family:var(--mono);font-size:8px;color:var(--muted);border-top:1px solid var(--line);
+        padding:12px;margin-top:6px;letter-spacing:.2em;text-transform:uppercase}}
+#pdf-fab{{position:fixed;bottom:26px;right:26px;z-index:9999}}
+#pdf-fab button{{background:var(--royal);color:#fff;border:none;padding:11px 20px;border-radius:10px;
+                font-family:var(--mono);font-size:11.5px;font-weight:700;letter-spacing:.06em;cursor:pointer;
+                box-shadow:0 8px 24px rgba(29,78,216,.35)}}
 @media print{{
-  @page{{margin:8mm;size:A4 portrait}}
+  @page{{margin:9mm;size:A4 portrait}}
   *{{-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}}
-  body{{background:#fff!important;font-size:11px}}
-  .page-header{{background:#F8FAFF!important}}
-  thead tr{{background:var(--royal)!important}}
-  .section{{margin-bottom:8px;break-inside:auto}}
-  #page{{background:#fff;padding:0}}
+  body{{background:#fff!important;font-size:10.5px}}
+  #page{{padding:0}}
+  .section{{margin-bottom:8px;break-inside:avoid}}
   #pdf-fab{{display:none!important}}
 }}
 </style>
 </head>
 <body>
-<div id="pdf-fab">
-  <button onclick="window.print()">📥 Télécharger PDF</button>
-</div>
+<div id="pdf-fab"><button onclick="window.print()">Télécharger PDF</button></div>
 <div id="page">
 
-<div class="page-header">
-  <div style="display:flex;align-items:center;gap:14px;">
-    <div style="width:34px;height:34px;display:flex;align-items:center;justify-content:center;background:white;border:1px solid var(--border);border-radius:6px;">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-        <path d="M12 17.27L18.18 21L16.54 13.97L22 9.24L14.81 8.63L12 2L9.19 8.63L2 9.24L7.46 13.97L5.82 21L12 17.27Z" fill="#1B45B4"/>
-      </svg>
-    </div>
+<div class="hdr">
+  <div class="hdr-l">
+    <div class="logo">◆</div>
     <div>
-      <div style="font-size:9px;letter-spacing:.3em;color:var(--royal-dim);font-family:var(--mono);font-weight:600;text-transform:uppercase;">BLUESTAR SYSTEM</div>
-      <div style="font-size:20px;font-weight:700;color:var(--dark);letter-spacing:-.02em;font-family:var(--mono);line-height:1.1;">BLUESTAR</div>
-      <div style="font-size:9px;color:var(--muted);font-family:var(--mono);">FX INSTITUTIONAL DESK · v10.0</div>
+      <div class="eyebrow">Bluestar System</div>
+      <div class="h1">BLUESTAR</div>
+      <div class="h1s">FX Institutional Desk · v10.1</div>
     </div>
   </div>
-  <div style="text-align:right;border-left:1px solid var(--border2);padding-left:18px;">
-    <div style="font-size:11px;color:var(--royal);font-family:var(--mono);letter-spacing:.08em;font-weight:600;text-transform:uppercase;">INSTITUTIONAL MACRO BRIEFING</div>
-    <div style="font-size:9px;color:var(--sec);font-family:var(--mono);margin-top:4px;">Analyse Quantitative — OANDA v20 API · Auto-généré</div>
+  <div class="hdr-r">
+    <div class="hdr-r1">Institutional Macro Briefing</div>
+    <div class="hdr-r2">Analyse quantitative — OANDA v20 API · Auto-généré</div>
   </div>
 </div>
 
-<div class="page-subbar">
-  <span>📅 {html.escape(date_str)}</span>
-  <span>🕐 {html.escape(time_str)} CET — {html.escape(session)}</span>
-  <span style="margin-left:auto;font-weight:600;color:var(--royal);background:rgba(27,69,180,.08);padding:2px 10px;border-radius:20px;font-size:9px;">● CONFIDENTIEL</span>
+<div class="subbar">
+  <span>{html.escape(date_str)}</span>
+  <span>{html.escape(time_str)} CET — {html.escape(session)}</span>
+  <span class="conf">Confidentiel</span>
 </div>
 
 <div class="section">
   <div class="sec-hdr"><div class="sec-num">1</div><div class="sec-ttl">Force des Devises — Moteur W/D/H4/H1</div></div>
   <div class="sec-body">
-    <div style="display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 14px;margin-bottom:14px;flex-wrap:wrap;">
-      <span style="font-size:9px;font-family:var(--mono);color:var(--muted);letter-spacing:1px;text-transform:uppercase;flex-shrink:0;">Régime inféré</span>
-      <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:{r_col};background:{r_bg};padding:3px 12px;border-radius:4px;">{html.escape(regime_label)}</span>
-      <span style="margin-left:auto;font-size:10px;color:var(--muted);font-family:var(--mono);">
-        Couverture&nbsp;: <strong style="color:{cov_col};">{cov_pct}%</strong>
-        &nbsp;·&nbsp;Timeframe Map&nbsp;: <strong>{html.escape(granularity)}</strong>
-      </span>
+    <div class="banner">
+      <span class="banner-l">Régime inféré</span>
+      <span class="regime" style="color:{r_col};background:{r_bg};border-color:{r_bd};">{html.escape(regime_label)}</span>
+      <span class="banner-r">Couverture <strong style="color:{cov_col};">{cov_pct}%</strong>
+        &nbsp;·&nbsp; Timeframe Map <strong>{html.escape(granularity)}</strong></span>
     </div>
     <table>
-      <thead><tr><th>#</th><th>Devise</th><th>Score 0–10</th><th>Vélocité H1</th></tr></thead>
+      <thead><tr><th>#</th><th>Devise</th><th style="text-align:center;">Score</th><th>Distribution</th><th style="text-align:center;">Vélocité H1</th></tr></thead>
       <tbody>{rows_html}</tbody>
     </table>
   </div>
@@ -1677,24 +1977,21 @@ tbody td{{padding:7px 12px;vertical-align:middle;border-bottom:1px solid var(--b
 <div class="section">
   <div class="sec-hdr"><div class="sec-num">★</div><div class="sec-ttl">Contexte Externe — À Injecter Avant LLM</div></div>
   <div class="sec-body">
-    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;">{ext_html}</div>
-    <div style="font-size:10px;color:var(--muted);font-family:var(--mono);background:var(--card);border:1px solid var(--border);border-radius:6px;padding:10px 14px;">
-      ℹ️ VIX · DXY · US10Y · MOVE non disponibles via OANDA v20 API. Injecter via CBOE / FRED / Bloomberg dans le champ <code>external_required</code> du JSON avant exécution du prompt BLUESTAR_MACRO_BRIEFING.
-    </div>
+    <div class="tilewrap" style="margin-bottom:12px;">{ext_html}</div>
+    <div class="note">VIX · DXY · US10Y · MOVE ne sont pas disponibles via l'API OANDA v20.
+    Injecter ces valeurs via CBOE / FRED / Bloomberg dans le champ <code>external_required</code>
+    du JSON avant exécution du prompt BLUESTAR_MACRO_BRIEFING.</div>
   </div>
 </div>
 
-<div class="footer">CONFIDENTIEL — BLUESTAR SYSTEM · FX INSTITUTIONAL DESK · v10.0 · Généré le {html.escape(date_str)} {html.escape(time_str)} CET</div>
+<div class="footer">Confidentiel — Bluestar System · FX Institutional Desk · v10.1 · {html.escape(date_str)} {html.escape(time_str)} CET</div>
 </div>
 </body>
 </html>"""
 
 
 def generate_pdf_bytes(briefing_html: str) -> Optional[bytes]:
-    """
-    Convertit le HTML en PDF via WeasyPrint.
-    Retourne None si WeasyPrint n'est pas installé (fallback HTML dans l'UI).
-    """
+    """Convertit le HTML en PDF via WeasyPrint (None si indisponible)."""
     try:
         from weasyprint import HTML as WP_HTML  # type: ignore[import]
         return WP_HTML(string=briefing_html).write_pdf()
@@ -1709,47 +2006,68 @@ def generate_pdf_bytes(briefing_html: str) -> Optional[bytes]:
 # ── 6. Sidebar ────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("Connexion OANDA")
+    st.markdown(
+        '<div class="sb-brand"><div class="sb-brand-t">◆ BLUESTAR</div>'
+        '<div class="sb-brand-s">Strength Engine v10.1</div></div>',
+        unsafe_allow_html=True,
+    )
+
     if "OANDA_ACCESS_TOKEN" not in st.secrets:
         st.error("Token OANDA introuvable dans les secrets.")
         st.stop()
     current_token = st.secrets["OANDA_ACCESS_TOKEN"]
-    current_env = st.selectbox("Env", ["practice", "live"])
-    st.markdown("---")
+
+    st.markdown('<div class="sb-lbl">Connexion</div>', unsafe_allow_html=True)
+    current_env = st.selectbox("Env", ["practice", "live"], label_visibility="collapsed")
+
+    st.markdown('<div class="sb-lbl">Timeframe — Market Map</div>', unsafe_allow_html=True)
     current_granularity = st.selectbox(
-        "Timeframe (Map)", ["M5", "M15", "M30", "H1", "H4", "D"], index=3
+        "Timeframe (Map)",
+        ["M5", "M15", "M30", "H1", "H4", "D"],
+        index=3,
+        label_visibility="collapsed",
     )
-    # v10: optional map smoothing control
+
+    st.markdown('<div class="sb-lbl">Lissage de la Map</div>', unsafe_allow_html=True)
     map_smooth = st.selectbox(
         "Map Smooth",
         [1, 3, 5],
         index=0,
-        format_func=lambda x: "Legacy (1)" if x == 1 else f"Lissé ({x})",
+        format_func=lambda x: "Legacy (1 tick)" if x == 1 else f"Lissé ({x} ticks)",
+        label_visibility="collapsed",
+    )
+
+    st.markdown("---")
+    st.caption(
+        "Le moteur de force agrège W + D + H4 + H1 en parallèle, "
+        "indépendamment du timeframe affiché sur la Market Map."
     )
     st.caption(
-        "Le moteur de force utilise W + D + H4 + H1 en parallèle, "
-        "indépendamment du timeframe affiché."
+        f"Poids : W {TIMEFRAMES_MTF['W']['weight']} · D {TIMEFRAMES_MTF['D']['weight']} · "
+        f"H4 {TIMEFRAMES_MTF['H4']['weight']} · H1 {TIMEFRAMES_MTF['H1']['weight']}"
     )
 
 
-# ── 6. Exécution ──────────────────────────────────────────────────────────────
+# ── 7. Exécution ──────────────────────────────────────────────────────────────
 
 if current_token:
     token_fp = token_fingerprint(current_token)
-    with st.status("Actualisation des données...", expanded=True) as status:
-        result = _run_engine_cached(token_fp, current_env)
 
+    with st.status("Actualisation des données OANDA…", expanded=False) as status:
+        result = _run_engine_cached(token_fp, current_env)
         map_data = fetch_market_map_data(token_fp, current_env, current_granularity)
         df_prices, pct_special, pair_changes = map_data
+        status.update(label="Données chargées", state="complete", expanded=False)
 
-        status.update(label="✅ Données chargées", state="complete", expanded=False)
+    regime_now = _infer_regime(pct_special)
+    ts_label   = datetime.datetime.now().strftime("%d/%m %H:%M")
 
-    # v10: health check display
+    st.markdown(
+        app_header(current_env, current_granularity, regime_now, ts_label),
+        unsafe_allow_html=True,
+    )
+
     health = result.health_check()
-    if health["status"] == "degraded":
-        st.info(
-            f"ℹ️ Health: {health['status']} (coverage_min={health['coverage_min']})"
-        )
 
     if not result.valid:
         st.error("Impossible de calculer les forces : " + "; ".join(result.warnings))
@@ -1758,9 +2076,65 @@ if current_token:
             st.warning(w)
 
     if result.scores_display and result.valid:
-        st.subheader("💱 Forces Forex (0–10) — Moteur institutionnel W/D/H4/H1")
-        c1, c2, c3, c4 = st.columns(4)
-        cols = [c1, c2, c3, c4]
+        # ── KPI strip ─────────────────────────────────────────────────────────
+        top_cur    = result.ranking[0]
+        bot_cur    = result.ranking[-1]
+        top_score  = result.scores_display.get(top_cur, 0.0)
+        bot_score  = result.scores_display.get(bot_cur, 0.0)
+        spread_val = top_score - bot_score
+        cov_pct_ui = int(health.get("coverage_min", 0) * 100)
+        cov_color  = T.UP if cov_pct_ui >= 80 else (T.WARN if cov_pct_ui >= 50 else T.DOWN)
+        health_col = T.UP if health["status"] == "ok" else T.WARN
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1:
+            st.markdown(
+                kpi_tile("Devise la plus forte", f"{top_cur} · {top_score:.1f}",
+                         "Sommet du classement", T.UP),
+                unsafe_allow_html=True,
+            )
+        with k2:
+            st.markdown(
+                kpi_tile("Devise la plus faible", f"{bot_cur} · {bot_score:.1f}",
+                         "Bas du classement", T.DOWN),
+                unsafe_allow_html=True,
+            )
+        with k3:
+            st.markdown(
+                kpi_tile("Dispersion", f"{spread_val:.2f}",
+                         f"Seuil signal ≥ {MIN_STRENGTH_DIFF}", T.ACCENT),
+                unsafe_allow_html=True,
+            )
+        with k4:
+            st.markdown(
+                kpi_tile("Couverture données", f"{cov_pct_ui}%",
+                         f"{result.pairs_fetched} séries en cache", cov_color),
+                unsafe_allow_html=True,
+            )
+        with k5:
+            st.markdown(
+                kpi_tile("Statut moteur", health["status"].upper(),
+                         f"{len(result.warnings)} alerte(s)", health_col),
+                unsafe_allow_html=True,
+            )
+
+        # ── Forces devises ────────────────────────────────────────────────────
+        st.markdown(
+            section_title("Forces Forex", "Échelle 0–10 · Moteur institutionnel W/D/H4/H1"),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="bs-legend">'
+            f'<span><i class="bs-sw" style="background:{T.UP}"></i>Fort ≥ 7.0</span>'
+            f'<span><i class="bs-sw" style="background:{T.ACCENT}"></i>Modéré 5.5–7.0</span>'
+            f'<span><i class="bs-sw" style="background:{T.WARN}"></i>Faible 4.0–5.5</span>'
+            f'<span><i class="bs-sw" style="background:{T.DOWN}"></i>Très faible &lt; 4.0</span>'
+            '<span>▲ / ▼ vélocité H1 (48 vs 48 barres)</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        cols = st.columns(4)
         for i, curr in enumerate(result.ranking):
             with cols[i % 4]:
                 st.markdown(
@@ -1768,72 +2142,95 @@ if current_token:
                         name      = curr,
                         score     = result.scores_display[curr],
                         arrow_str = result.direction_arrow(curr),
+                        rank      = i + 1,
+                        velocity  = result.velocity.get(curr, 0.0),
                     ),
                     unsafe_allow_html=True,
                 )
 
-        if result.best_pairs:
-            st.markdown("---")
-            st.subheader("🎯 Paires Sélectionnées")
-            badges = ""
-            for d in result.pairs_detail:
-                dir_color = "#10B981" if d["direction"] == "BUY" else "#EF4444"
-                badges += (
-                    f'<span style="display:inline-block;padding:4px 12px;'
-                    f'background:{dir_color};color:white;border-radius:4px;'
-                    f'font-weight:bold;margin:3px;font-size:0.9rem;">'
-                    f'{html.escape(d["exec_pair"])} {d["direction"]}</span>'
-                    f'<span style="font-size:0.75rem;color:#9ca3af;margin-right:12px;">'
-                    f'diff={d["diff"]:.2f}'
-                    f'{" | ATR=" + str(d["atr"]) + "%" if d["atr"] else ""}'
-                    f'</span>'
-                )
-            st.markdown(badges, unsafe_allow_html=True)
+        # ── Paires sélectionnées ──────────────────────────────────────────────
+        st.markdown(
+            section_title(
+                "Paires Sélectionnées",
+                f"Diff ≥ {MIN_STRENGTH_DIFF} · Filtre ATR P{ATR_MIN_PERCENTILE} · "
+                f"Max {MAX_PAIRS} · 1 exposition par devise",
+            ),
+            unsafe_allow_html=True,
+        )
+        if result.pairs_detail:
+            st.markdown(
+                "".join(pair_card_html(d) for d in result.pairs_detail),
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="pair-empty">Aucune paire ne satisfait les filtres '
+                'de force et de volatilité pour le moment.</div>',
+                unsafe_allow_html=True,
+            )
 
-        st.markdown("---")
-        st.subheader("🗺️ Market Map Pro")
+        # ── Market Map ────────────────────────────────────────────────────────
+        st.markdown(
+            section_title("Market Map", f"Variation {current_granularity} · OANDA mid-price"),
+            unsafe_allow_html=True,
+        )
         if pair_changes:
             html_map = generate_exact_map_html(pair_changes, pct_special)
-            st.components.v1.html(html_map, height=600, scrolling=True)
+            st.components.v1.html(html_map, height=640, scrolling=True)
         else:
             st.warning("Données insuffisantes pour la Market Map.")
 
         # ── Exports ───────────────────────────────────────────────────────────
-        st.markdown("---")
-        st.subheader("📤 Exports")
+        st.markdown(
+            section_title("Exports", "Pipeline macro & briefing institutionnel"),
+            unsafe_allow_html=True,
+        )
         col_json, col_pdf = st.columns(2)
         fname_date = datetime.date.today().strftime("%Y-%m-%d")
 
         with col_json:
-            json_str = generate_json_export(result, pair_changes, pct_special, current_granularity)
+            json_str = generate_json_export(
+                result, pair_changes, pct_special, current_granularity
+            )
             st.download_button(
-                label     = "📊 Export JSON — Pipeline Macro",
+                label     = "⬇  JSON — Pipeline Macro",
                 data      = json_str,
                 file_name = f"BLUESTAR_{fname_date}.json",
                 mime      = "application/json",
-                help      = "JSON structuré pour BLUESTAR_MACRO_BRIEFING_PROMPT · champs external_required à compléter",
+                help      = "JSON structuré pour BLUESTAR_MACRO_BRIEFING_PROMPT · "
+                            "champs external_required à compléter",
             )
-            st.caption("JSON exploitable : force devises, market map DAX/WTI/indices, paires sélectionnées, placeholders VIX/DXY/US10Y.")
+            st.caption(
+                "Force devises · market map (indices, DAX, WTI) · paires sélectionnées · "
+                "placeholders VIX / DXY / US10Y / MOVE."
+            )
 
         with col_pdf:
-            briefing_html_str = generate_briefing_html(result, pair_changes, pct_special, current_granularity)
+            briefing_html_str = generate_briefing_html(
+                result, pair_changes, pct_special, current_granularity
+            )
             pdf_bytes = generate_pdf_bytes(briefing_html_str)
             if pdf_bytes:
                 st.download_button(
-                    label     = "📥 Export PDF — Briefing Institutionnel",
+                    label     = "⬇  PDF — Briefing Institutionnel",
                     data      = pdf_bytes,
                     file_name = f"Macro_Briefing_BLUESTAR_{fname_date}.pdf",
                     mime      = "application/pdf",
                 )
-                st.caption("PDF auto-généré : force devises, paires, snapshot marché, placeholders externes.")
+                st.caption(
+                    "PDF auto-généré : classement des forces, paires, snapshot marché, "
+                    "placeholders externes."
+                )
             else:
-                # WeasyPrint absent — HTML fallback (Chrome → Enregistrer en PDF)
                 st.download_button(
-                    label     = "📄 Export HTML → PDF via Chrome",
+                    label     = "⬇  HTML — Briefing (impression PDF)",
                     data      = briefing_html_str,
                     file_name = f"Macro_Briefing_BLUESTAR_{fname_date}.html",
                     mime      = "text/html",
                 )
-                st.caption("WeasyPrint non détecté. Ouvrir le HTML dans Chrome → Ctrl+P → Enregistrer en PDF (activer Graphiques d'arrière-plan).")
+                st.caption(
+                    "WeasyPrint non détecté. Ouvrir le HTML dans Chrome → Ctrl+P → "
+                    "Enregistrer en PDF (activer « Graphiques d'arrière-plan »)."
+                )
 else:
-    st.warning("En attente du Token OANDA...")
+    st.warning("En attente du Token OANDA…")
