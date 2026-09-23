@@ -1,5 +1,5 @@
-streamlit
-oandapyV20
-pandas
-numpy
-plotly
+streamlit>=1.35,<2
+oandapyV20==0.7.2
+pandas>=2.0,<3
+numpy>=1.26,<2
+requests>=2.31,<3

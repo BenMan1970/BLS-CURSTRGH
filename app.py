@@ -20,6 +20,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
+from datetime import timezone as tz
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -39,7 +40,6 @@ ATR_MIN_PERCENTILE: int = 25
 MAX_PAIRS: int = 3
 MAX_CURRENCY_EXPOSURE: int = 1
 MIN_RAW_SPREAD: float = 0.15
-HTTP_TIMEOUT: float = 8.0
 
 # Market Map smoothing: 1 = legacy exact (single-tick), 3+ = anti-flicker
 MAP_SMOOTH_WINDOW: int = 1
@@ -160,9 +160,8 @@ class OandaClient:
     def __init__(self, api: API) -> None:
         self._api = api
 
-    def request(self, endpoint, timeout: float = HTTP_TIMEOUT):
+    def request(self, endpoint):
         """Wrapper with retry logic for 429 rate limits."""
-        last_err: Optional[Exception] = None
         for attempt in range(3):
             try:
                 return self._api.request(endpoint)
@@ -189,7 +188,6 @@ class OandaClient:
                     time.sleep(1.0)
                     continue
                 raise BluestarTimeout(str(exc)) from exc
-        raise BluestarError(f"Unexpected failure after retries: {last_err}")
 
 
 # ==========================================
@@ -209,21 +207,6 @@ class StrengthResult:
     coverage:       Dict[str, float] = field(default_factory=dict)
     warnings:       List[str]        = field(default_factory=list)
     valid:          bool             = True
-
-    def to_dict(self) -> dict:
-        """Exporte le résultat sous forme de dictionnaire."""
-        return {
-            "scores":         self.scores,
-            "scores_display": self.scores_display,
-            "ranking":        self.ranking,
-            "velocity":       self.velocity,
-            "best_pairs":     self.best_pairs,
-            "pairs_detail":   self.pairs_detail,
-            "pairs_fetched":  self.pairs_fetched,
-            "coverage":       self.coverage,
-            "warnings":       self.warnings,
-            "valid":          self.valid,
-        }
 
     def direction_arrow(self, currency: str) -> str:
         """Retourne la flèche directionnelle pour une devise."""
@@ -788,7 +771,7 @@ class StrengthEngine:
     # ── Vélocité (H1 pure) ────────────────────────────────────────────────────
 
     def _compute_velocity(self) -> Dict[str, float]:
-        """Calcule la vélocité sur deux fenêtres H1 de 48 barres."""
+        """Calcule la vélocité sur deux fenêtres H1 de 60 barres."""
         total_now:  Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         total_prev: Dict[str, float] = {c: 0.0 for c in CURRENCIES}
         weight_sum: Dict[str, float] = {c: 0.0 for c in CURRENCIES}
@@ -796,10 +779,10 @@ class StrengthEngine:
         for pair in PAIRS:
             base, quote = pair.split("_")
             df = self._fetch_ohlcv(pair, "H1", 300)
-            if df is None or len(df) < 96:
+            if df is None or len(df) < 120:
                 continue
-            df_now  = df.iloc[-48:]
-            df_prev = df.iloc[-96:-48]
+            df_now  = df.iloc[-60:]
+            df_prev = df.iloc[-120:-60]
             trend_now, strength_now = trend_h1(df_now)
             trend_prev, strength_prev = trend_h1(df_prev)
 
@@ -858,7 +841,12 @@ class StrengthEngine:
         best_pairs, pairs_detail = self._select_pairs(scores_display)
 
         total_weight = sum(cfg["weight"] for cfg in TIMEFRAMES_MTF.values())
-        coverage = {c: weight_sum[c] / total_weight for c in CURRENCIES}
+        pair_count = {c: 0 for c in CURRENCIES}
+        for pair in PAIRS:
+            b, q = pair.split("_")
+            pair_count[b] += 1
+            pair_count[q] += 1
+        coverage = {c: (weight_sum[c] / (pair_count[c] * total_weight) if pair_count[c] else 0.0) for c in CURRENCIES}
         warnings = []
         if self.errors:
             warnings.append(f"{len(self.errors)} erreur(s) API (voir logs).")
@@ -882,54 +870,6 @@ class StrengthEngine:
             pairs_fetched  = pairs_fetched,
             coverage       = coverage,
             warnings       = warnings,
-            valid          = True,
-        )
-
-    def run_quick(self, granularity: str = "H1") -> StrengthResult:
-        """Version rapide mono-timeframe (conservée pour compatibilité)."""
-        self._cache.clear()
-        self.errors.clear()
-        total:      Dict[str, float] = {c: 0.0 for c in CURRENCIES}
-        weight_sum: Dict[str, float] = {c: 0.0 for c in CURRENCIES}
-        tf     = "H1" if granularity in ("H1", "M30", "M15", "M5") else "H4"
-        cfg    = TIMEFRAMES_MTF[tf]
-        weight = cfg["weight"]
-        for pair in PAIRS:
-            base, quote = pair.split("_")
-            df = self._fetch_ohlcv(pair, cfg["gran_fetch"], cfg["count"])
-            if df is None:
-                continue
-            trend, strength = _TREND_FN[tf](df)
-            weight_sum[base]  += weight
-            weight_sum[quote] += weight
-
-            if trend == "Bullish":
-                contrib = +weight * (strength / 100)
-            elif trend == "Bearish":
-                contrib = -weight * (strength / 100)
-            else:
-                contrib = 0.0
-
-            total[base]  += contrib
-            total[quote] -= contrib
-
-        if tf != "H1":
-            cfg_h1 = TIMEFRAMES_MTF["H1"]
-            for pair in PAIRS:
-                self._fetch_ohlcv(pair, cfg_h1["gran_fetch"], cfg_h1["count"])
-
-        scores         = self._normalize(total, weight_sum)
-        scores_display = self._to_display(scores)
-        ranking        = sorted(scores.keys(), key=lambda c: scores[c], reverse=True)
-        best_pairs, pairs_detail = self._select_pairs(scores_display)
-        return StrengthResult(
-            scores         = {k: round(v, 6) for k, v in scores.items()},
-            scores_display = scores_display,
-            ranking        = ranking,
-            velocity       = {c: 0.0 for c in CURRENCIES},
-            best_pairs     = best_pairs,
-            pairs_detail   = pairs_detail,
-            pairs_fetched  = len(self._cache),
             valid          = True,
         )
 
@@ -1231,7 +1171,8 @@ def fetch_market_map_data(
     _token_fp: str,
     environment: str,
     gran: str,
-) -> Tuple[pd.DataFrame, Dict, Dict[str, float]]:
+    smooth: int = 1,
+) -> Tuple[Dict, Dict[str, float]]:
     """Market Map sans forward/backward fill."""
     local_pair_changes: Dict[str, float] = {}
     max_age_map = {
@@ -1244,7 +1185,7 @@ def fetch_market_map_data(
     }
     max_age = max_age_map.get(gran, pd.Timedelta(hours=1))
 
-    now_utc = pd.Timestamp.utcnow()
+    now_utc = pd.Timestamp.now(tz="UTC")
     for pair in FOREX_PAIRS:
         df = _fetch_candles_cached(_token_fp, environment, pair, gran, 30)
         if df is None or len(df) < 2:
@@ -1252,10 +1193,15 @@ def fetch_market_map_data(
         closes = df["Close"].dropna()
         if len(closes) < 2:
             continue
-        age = now_utc - closes.index[-1]
+        last_ts = pd.Timestamp(closes.index[-1])
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        else:
+            last_ts = last_ts.tz_convert("UTC")
+        age = now_utc - last_ts
         if age > max_age:
             continue
-        pct = _smoothed_pct(closes)
+        pct = _smoothed_pct(closes, smooth)
         if pct is None or not np.isfinite(pct):
             continue
         local_pair_changes[pair] = pct
@@ -1268,7 +1214,7 @@ def fetch_market_map_data(
         closes = df["Close"].dropna()
         if len(closes) < 2:
             continue
-        pct = _smoothed_pct(closes)
+        pct = _smoothed_pct(closes, smooth)
         if pct is None or not np.isfinite(pct):
             continue
         local_pct_special[name] = {
@@ -1276,8 +1222,7 @@ def fetch_market_map_data(
             "cat": "INDICES" if symbol in INDICES else "METAUX",
         }
 
-    local_df_prices = pd.DataFrame({pair: [1.0] for pair in local_pair_changes})
-    return local_df_prices, local_pct_special, local_pair_changes
+    return local_pct_special, local_pair_changes
 
 
 # ── 3. Composants UI ──────────────────────────────────────────────────────────
@@ -1586,7 +1531,7 @@ def generate_exact_map_html(
 
 def _session_label() -> str:
     """Session active selon l'heure UTC."""
-    h = datetime.datetime.utcnow().hour
+    h = datetime.datetime.now(tz).hour
     if 7 <= h < 12:
         return "London"
     if 12 <= h < 17:
@@ -1621,7 +1566,7 @@ def generate_json_export(
     granularity: str,
 ) -> str:
     """JSON structuré pour BLUESTAR_MACRO_BRIEFING_PROMPT."""
-    now = datetime.datetime.now()
+    now = datetime.datetime.now(tz)
 
     sym_to_name = {**INDICES, **METAUX}
     name_to_sym = {v: k for k, v in sym_to_name.items()}
@@ -1723,7 +1668,7 @@ def generate_briefing_html(
     granularity: str,
 ) -> str:
     """HTML institutionnel auto-peuplé depuis OANDA (design épuré, print-ready)."""
-    now      = datetime.datetime.now()
+    now      = datetime.datetime.now(tz)
     date_str = now.strftime("%d/%m/%Y")
     time_str = now.strftime("%H:%M")
     session  = _session_label()
@@ -1944,7 +1889,7 @@ td.barcell{{padding-right:22px}}
 
 <div class="subbar">
   <span>{html.escape(date_str)}</span>
-  <span>{html.escape(time_str)} CET — {html.escape(session)}</span>
+  <span>{html.escape(time_str)} UTC — {html.escape(session)}</span>
   <span class="conf">Confidentiel</span>
 </div>
 
@@ -2012,10 +1957,14 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    if "OANDA_ACCESS_TOKEN" not in st.secrets:
+    try:
+        current_token = st.secrets["OANDA_ACCESS_TOKEN"]
+    except (FileNotFoundError, KeyError):
+        current_token = None
+
+    if not current_token:
         st.error("Token OANDA introuvable dans les secrets.")
         st.stop()
-    current_token = st.secrets["OANDA_ACCESS_TOKEN"]
 
     st.markdown('<div class="sb-lbl">Connexion</div>', unsafe_allow_html=True)
     current_env = st.selectbox("Env", ["practice", "live"], label_visibility="collapsed")
@@ -2054,9 +2003,18 @@ if current_token:
     token_fp = token_fingerprint(current_token)
 
     with st.status("Actualisation des données OANDA…", expanded=False) as status:
-        result = _run_engine_cached(token_fp, current_env)
-        map_data = fetch_market_map_data(token_fp, current_env, current_granularity)
-        df_prices, pct_special, pair_changes = map_data
+        try:
+            result = _run_engine_cached(token_fp, current_env)
+        except BluestarError as exc:
+            st.error(f"Échec du moteur : {exc}")
+            st.stop()
+        except Exception as exc:
+            logger.exception("Erreur inattendue moteur")
+            st.error(f"Erreur inattendue : {exc}")
+            st.stop()
+        pct_special, pair_changes = fetch_market_map_data(
+            token_fp, current_env, current_granularity, map_smooth
+        )
         status.update(label="Données chargées", state="complete", expanded=False)
 
     regime_now = _infer_regime(pct_special)
