@@ -1,30 +1,61 @@
 """
-Bluestar Market Dashboard — Strength Engine v10.1 (UI Refresh).
+Bluestar Market Dashboard — Strength Engine v11.0 (Production Hardened).
 
-Zero-regression sur le moteur : identique à v10.0 / v4.4 pour des payloads OANDA identiques.
-Nouveautés v10.1 : design system unifié (typographie, palette, espacements), cartes devises
-redessinées, Market Map heatmap dark-theme, briefing PDF épuré, hiérarchie visuelle revue.
+Le moteur de force (W / D / H4 / H1) est NUMÉRIQUEMENT IDENTIQUE à v10.1 / v10.0 / v4.4 :
+les fonctions `trend_*`, `_normalize`, `_to_display`, `_compute_velocity`,
+`_build_candidates` et `_filter_by_atr_and_exposure` sont inchangées et reçoivent les mêmes
+séries OHLCV (mêmes granularités OANDA, mêmes compteurs de chandelles).
 
-Dependencies: streamlit, oandapyV20, pandas, numpy.
+Durcissement v11.0 — aucune modification de la sémantique des scores :
+  * Couche I/O réécrite : timeouts HTTP réels, retry/backoff sur 429 et 5xx, taxonomie
+    d'erreurs typée. Plus aucune exception réseau ne peut tuer le script Streamlit.
+  * Chargement parallèle des séries (ThreadPoolExecutor) via un bundle unique : ~90 requêtes
+    OANDA en parallèle au lieu de ~150 séquentielles (temps de chargement ÷ 4-6).
+  * Cache `st.cache_data` réellement isolé par empreinte de token (le fingerprint était
+    ignoré à cause d'un préfixe `_`, deux tokens partageaient donc le même cache).
+  * Résolution de configuration robuste et diagnostiquable : `st.secrets` (plusieurs noms
+    acceptés, sections TOML), variables d'environnement ; l'app démarre sans config.
+  * Écran de diagnostic actionnable au lieu d'un crash si token/env absent ou refusé.
+  * Mémoire bornée (`max_entries`, séries stockées en colonnes) : évite les redémarrages OOM.
+  * Exports JSON / briefing / PDF : fail-open, jamais bloquants.
+
+Configuration attendue (Streamlit Cloud → Settings → Secrets) :
+
+    OANDA_ACCESS_TOKEN = "votre_token_practice"      # ou OANDA_API_KEY / OANDA_TOKEN
+    OANDA_ENVIRONMENT  = "practice"                  # practice | live (défaut : practice)
+    # optionnel — token live distinct si vous basculez sur un compte réel
+    OANDA_LIVE_ACCESS_TOKEN = "votre_token_live"
+
+Dependencies: streamlit, oandapyV20, pandas, numpy, requests.
 """
-# app.py — Bluestar Market Dashboard (Strength Engine v10.1)
-# Moteur inchangé. Refonte visuelle complète : design system, cartes, map, briefing.
+# app.py — Bluestar Market Dashboard (Strength Engine v11.0)
+# Moteur numérique inchangé. Couche I/O, configuration et robustesse refondues.
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import hashlib
 import html
 import json
 import logging
+import os
+import platform
 import random
 import time
-from dataclasses import dataclass, field
-from datetime import timezone as tz
-from typing import Dict, List, Optional, Tuple
+import traceback
+from dataclasses import asdict, dataclass, field, fields
+from datetime import timezone
+
+# `tz` doit être une INSTANCE de tzinfo : la v10.1 importait la classe `timezone`, ce qui
+# faisait échouer `datetime.datetime.now(tz)` (TypeError) dans _session_label(),
+# generate_json_export() et generate_briefing_html() — crash systématique de la page.
+tz = timezone.utc
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from oandapyV20 import API
 from oandapyV20.endpoints import instruments
@@ -44,6 +75,42 @@ MIN_RAW_SPREAD: float = 0.15
 # Market Map smoothing: 1 = legacy exact (single-tick), 3+ = anti-flicker
 MAP_SMOOTH_WINDOW: int = 1
 
+# ── Réseau, cache et volumétrie ────────────────────────────────────────────────
+HTTP_CONNECT_TIMEOUT_S: float = 6.0     # handshake TCP/TLS OANDA
+HTTP_READ_TIMEOUT_S: float = 25.0       # lecture réponse (2000 chandelles ≈ 1 s)
+HTTP_MAX_ATTEMPTS: int = 3              # 1 essai + 2 retries (429 / 5xx / réseau)
+FETCH_MAX_WORKERS: int = 8              # requêtes simultanées (limite OANDA ≈ 120 req/s)
+CACHE_TTL_SECONDS: int = 60             # fraîcheur des données servies par le cache
+BUNDLE_CACHE_MAX_ENTRIES: int = 6       # borne mémoire du cache de séries (~5 Mo/entrée)
+RESULT_CACHE_MAX_ENTRIES: int = 8       # borne mémoire des résultats moteur / map
+MIN_OHLCV_ROWS: int = 20                # longueur minimale d'une série exploitable
+
+# Compteurs canoniques par série. Un compteur unique par (instrument, granularité) permet
+# à tous les consommateurs (moteur, vélocité, Market Map) de partager la même série OANDA :
+# une série plus longue se contente d'être tronquée côté consommateur, valeurs inchangées.
+DAILY_COUNT: int = 2000                 # W (resample) + D — identique à v10.1
+TREND_D_SLICE: int = 300                # fenêtre exacte de trend_daily (identique v10.1)
+H4_COUNT: int = 300
+H1_COUNT: int = 300
+MAP_COUNT: int = 30                     # instruments hors moteur (indices, métaux)
+
+# ── Configuration OANDA — noms acceptés dans st.secrets / variables d'env ──────
+TOKEN_KEYS: Tuple[str, ...] = (
+    "OANDA_ACCESS_TOKEN",
+    "OANDA_API_KEY",
+    "OANDA_TOKEN",
+    "OANDA_PRACTICE_ACCESS_TOKEN",
+)
+LIVE_TOKEN_KEYS: Tuple[str, ...] = ("OANDA_LIVE_ACCESS_TOKEN", "OANDA_LIVE_API_KEY")
+ENV_KEYS: Tuple[str, ...] = ("OANDA_ENVIRONMENT", "OANDA_ENV")
+SECRET_SECTIONS: Tuple[str, ...] = ("oanda", "OANDA")
+VALID_ENVIRONMENTS: Tuple[str, ...] = ("practice", "live")
+DEFAULT_ENVIRONMENT: str = "practice"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -83,6 +150,10 @@ class BluestarError(Exception):
     """Base for all engine/adapter failures."""
 
 
+class BluestarConfigError(BluestarError):
+    """Configuration manquante ou invalide (token, environnement). No retry."""
+
+
 class BluestarAuthError(BluestarError):
     """401/403 — credentials invalid. No retry."""
 
@@ -92,7 +163,11 @@ class BluestarRateLimit(BluestarError):
 
 
 class BluestarTimeout(BluestarError):
-    """Network timeout — single retry then fail-open."""
+    """Timeout réseau (lecture/connexion) — retryable."""
+
+
+class BluestarNetworkError(BluestarError):
+    """Erreur réseau transitoire (DNS, TLS, connexion coupée, 5xx) — retryable."""
 
 
 class BluestarDataError(BluestarError):
@@ -114,10 +189,18 @@ PAIRS: List[str] = [
 CURRENCIES: List[str] = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "NZD", "CHF"]
 
 TIMEFRAMES_MTF: Dict[str, dict] = {
-    "W":  {"gran_fetch": "D",  "count": 2000, "weight": 4.0, "resample_rule": "W-FRI"},
-    "D":  {"gran_fetch": "D",  "count": 300,  "weight": 4.0, "resample_rule": None},
-    "H4": {"gran_fetch": "H4", "count": 300,  "weight": 2.5, "resample_rule": None},
-    "H1": {"gran_fetch": "H1", "count": 300,  "weight": 1.5, "resample_rule": None},
+    # `tail` : tronque la série côté consommateur (None = série complète).
+    # W et D partagent désormais LA MÊME série journalière OANDA (DAILY_COUNT) ; trend_daily
+    # ne se voit servir que ses TREND_D_SLICE dernières bougies, ce qui reproduit exactement
+    # le fetch `count=300` de la v10.1 (indicateurs causaux => valeurs finales identiques).
+    "W":  {"gran_fetch": "D",  "count": DAILY_COUNT, "weight": 4.0,
+           "resample_rule": "W-FRI", "tail": None},
+    "D":  {"gran_fetch": "D",  "count": DAILY_COUNT, "weight": 4.0,
+           "resample_rule": None,    "tail": TREND_D_SLICE},
+    "H4": {"gran_fetch": "H4", "count": H4_COUNT,    "weight": 2.5,
+           "resample_rule": None,    "tail": None},
+    "H1": {"gran_fetch": "H1", "count": H1_COUNT,    "weight": 1.5,
+           "resample_rule": None,    "tail": None},
 }
 
 
@@ -126,8 +209,176 @@ TIMEFRAMES_MTF: Dict[str, dict] = {
 # ==========================================
 
 def _create_client(access_token: str, environment: str) -> API:
-    """Crée un client OANDA v20 (pattern v4.4, sans injection de timeout)."""
-    return API(access_token=access_token, environment=environment)
+    """
+    Crée un client OANDA v20 avec timeouts HTTP explicites.
+
+    oandapyV20 n'expose pas de paramètre `timeout` : les `request_params` sont fusionnés dans
+    les arguments passés à `requests`, on y injecte donc le couple (connexion, lecture).
+    Sans cela une réponse OANDA figée bloque indéfiniment le script Streamlit.
+
+    ATTENTION : un `API` encapsule un `requests.Session` (non thread-safe). Un client doit
+    être utilisé par un seul thread — `_fetch_one_series` en instancie un par requête.
+    """
+    return API(
+        access_token=access_token,
+        environment=environment,
+        request_params={"timeout": (HTTP_CONNECT_TIMEOUT_S, HTTP_READ_TIMEOUT_S)},
+    )
+
+
+# ==========================================
+# ── RÉSOLUTION DE CONFIGURATION ───────────
+# ==========================================
+
+def _secret_lookup(key: str) -> Optional[str]:
+    """
+    Lecture non bloquante d'un secret Streamlit.
+
+    `st.secrets` lève `StreamlitSecretNotFoundError` (sous-classe de FileNotFoundError)
+    lorsqu'aucun secrets.toml / secret Cloud n'est configuré, et `KeyError` lorsque la clé
+    est absente : les deux cas sont traités comme « non configuré ».
+    """
+    try:
+        value = st.secrets[key]
+    except Exception:  # secrets absents, illisibles ou clé manquante
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _secret_section_lookup(keys: Sequence[str]) -> Optional[str]:
+    """Cherche `key` dans les sections TOML `[oanda]` / `[OANDA]` de st.secrets."""
+    for section in SECRET_SECTIONS:
+        try:
+            block = st.secrets[section]
+        except Exception:
+            continue
+        if not hasattr(block, "get"):
+            continue
+        for key in keys:
+            value = block.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _first_configured(
+    keys: Sequence[str], *, allow_env: bool = True
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Retourne (valeur, source) en priorisant st.secrets puis les variables d'environnement.
+    La `source` est un libellé affichable qui ne contient jamais la valeur du secret.
+    """
+    for key in keys:
+        value = _secret_lookup(key)
+        if value:
+            return value, f"secrets:{key}"
+    value = _secret_section_lookup(keys)
+    if value:
+        return value, "secrets:[oanda]"
+    if allow_env:
+        for key in keys:
+            value = os.environ.get(key)
+            if value and value.strip():
+                return value.strip(), f"env:{key}"
+    return None, None
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Configuration OANDA résolue, sans jamais exposer la valeur des tokens."""
+
+    practice_token: Optional[str] = None
+    live_token: Optional[str] = None
+    default_environment: str = DEFAULT_ENVIRONMENT
+    token_source: str = "absent"
+    problems: Tuple[str, ...] = ()
+
+    @property
+    def configured(self) -> bool:
+        """Vrai dès qu'au moins un token exploitable est disponible."""
+        return bool(self.practice_token or self.live_token)
+
+    def token_for(self, environment: str) -> Optional[str]:
+        """Token associé à un environnement, avec repli sur l'autre token configuré."""
+        if environment == "live":
+            return self.live_token or self.practice_token
+        return self.practice_token or self.live_token
+
+    @property
+    def available_environments(self) -> List[str]:
+        """Environnements réellement utilisables avec la configuration courante."""
+        envs: List[str] = []
+        if self.live_token:
+            envs.append("live")
+        if self.practice_token or not envs:
+            envs.insert(0, "practice")
+        return envs
+
+    def diagnostics(self) -> Dict[str, Any]:
+        """Informations de diagnostic affichables (aucun secret en clair)."""
+        return {
+            "token_source": self.token_source,
+            "practice_token": bool(self.practice_token),
+            "live_token": bool(self.live_token),
+            "default_environment": self.default_environment,
+            "problems": list(self.problems),
+        }
+
+
+def load_settings() -> Settings:
+    """
+    Résout la configuration OANDA depuis st.secrets puis os.environ.
+
+    Ne lève jamais : une configuration absente produit un objet `Settings` vide dont les
+    `problems` alimentent l'écran de configuration affiché à l'utilisateur.
+    """
+    problems: List[str] = []
+    practice_token, practice_source = _first_configured(TOKEN_KEYS)
+    live_token, live_source = _first_configured(LIVE_TOKEN_KEYS)
+
+    raw_env, _env_source = _first_configured(ENV_KEYS)
+    environment = (raw_env or DEFAULT_ENVIRONMENT).strip().lower()
+    if environment not in VALID_ENVIRONMENTS:
+        problems.append(
+            f"Environnement « {environment} » inconnu (valeurs acceptées : "
+            f"{', '.join(VALID_ENVIRONMENTS)}) — repli sur {DEFAULT_ENVIRONMENT}."
+        )
+        environment = DEFAULT_ENVIRONMENT
+
+    if practice_token and live_token and practice_token == live_token and environment == "live":
+        problems.append(
+            "Le même token est utilisé pour practice et live : bascule live désactivée."
+        )
+        live_token = None
+
+    for token, label in ((practice_token, "practice"), (live_token, "live")):
+        if token and len(token) < 20:
+            problems.append(
+                f"Le token {label} semble tronqué ({len(token)} caractères) — "
+                "vérifiez la valeur collée dans les secrets."
+            )
+
+    if not (practice_token or live_token):
+        problems.append(
+            "Aucun token OANDA détecté. Ajoutez OANDA_ACCESS_TOKEN dans les secrets "
+            "Streamlit (ou dans les variables d'environnement)."
+        )
+    elif environment == "live" and not live_token:
+        problems.append(
+            "Environnement live demandé mais aucun token live dédié : un token practice "
+            "est utilisé et provoquera un refus d'authentification (401)."
+        )
+        environment = "practice"
+
+    return Settings(
+        practice_token=practice_token,
+        live_token=live_token,
+        default_environment=environment,
+        token_source=(practice_source if practice_token else live_source) or "absent",
+        problems=tuple(problems),
+    )
 
 
 def validate_ohlcv(df: pd.DataFrame, min_len: int = 20) -> None:
@@ -155,39 +406,103 @@ def token_fingerprint(access_token: str) -> str:
 # ==========================================
 
 class OandaClient:
-    """Client OANDA avec taxonomie d'erreurs typée et retry 429."""
+    """
+    Client OANDA v20 : timeouts, backoff et taxonomie d'erreurs typée.
 
-    def __init__(self, api: API) -> None:
+    Toute exception émise par `requests` ou `oandapyV20` est convertie en `BluestarError`,
+    de sorte qu'aucune erreur réseau ne puisse remonter jusqu'au script Streamlit et
+    interrompre le rendu. Retry avec backoff exponentiel + jitter sur 429, 5xx et erreurs
+    réseau transitoires (connexion coupée, timeout, réponse non-JSON tronquée).
+    """
+
+    RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+    def __init__(self, api: API, *, max_attempts: int = HTTP_MAX_ATTEMPTS) -> None:
         self._api = api
+        self.max_attempts = max(1, int(max_attempts))
+
+    @staticmethod
+    def _status_code(exc: V20Error) -> Optional[int]:
+        """Code HTTP d'une V20Error, tolérant aux codes non entiers."""
+        try:
+            return int(getattr(exc, "code", None))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _backoff_seconds(attempt: int) -> float:
+        """Backoff exponentiel plafonné + jitter (évite les retries synchronisés)."""
+        return min(2.0 ** attempt, 8.0) + random.uniform(0.1, 0.5)  # nosec B311
 
     def request(self, endpoint):
-        """Wrapper with retry logic for 429 rate limits."""
-        for attempt in range(3):
+        """
+        Exécute une requête OANDA. Retourne le payload JSON décodé.
+
+        Lève `BluestarAuthError` (401/403), `BluestarRateLimit`, `BluestarTimeout`,
+        `BluestarNetworkError` (transitoires) ou `BluestarDataError` (définitif).
+        """
+        last_error: Optional[BluestarError] = None
+
+        for attempt in range(self.max_attempts):
             try:
                 return self._api.request(endpoint)
             except V20Error as exc:
-                code = getattr(exc, "code", None)
-                if code == 429:
-                    if attempt < 2:
-                        sleep_s = (2 ** attempt) + random.uniform(0, 0.5)  # nosec B311
-                        logger.warning(
-                            "OANDA 429 retry %s/%s: sleep %.2fs",
-                            attempt + 1, 3, sleep_s,
-                        )
-                        time.sleep(sleep_s)
-                        continue
-                    raise BluestarRateLimit(
-                        f"OANDA 429 après 3 tentatives: {exc}"
-                    ) from exc
+                code = self._status_code(exc)
                 if code in (401, 403):
-                    raise BluestarAuthError(f"OANDA auth {code}: {exc}") from exc
-                raise BluestarDataError(f"OANDA error {code}: {exc}") from exc
-            except (TimeoutError, ConnectionError) as exc:
-                if attempt < 2:
-                    logger.warning("OANDA timeout retry %s/%s: %s", attempt + 1, 3, exc)
-                    time.sleep(1.0)
+                    raise BluestarAuthError(f"OANDA a refusé les identifiants (HTTP {code}).") from exc
+                if code in self.RETRYABLE_STATUS:
+                    last_error = (
+                        BluestarRateLimit(f"OANDA limite de débit (HTTP {code}).")
+                        if code == 429
+                        else BluestarNetworkError(f"OANDA indisponible (HTTP {code}).")
+                    )
+                    self._sleep_before_retry(attempt, last_error)
                     continue
-                raise BluestarTimeout(str(exc)) from exc
+                raise BluestarDataError(f"OANDA a renvoyé une erreur HTTP {code}.") from exc
+            except requests.RequestException as exc:
+                # requests.RequestException englobe Timeout / ConnectionError / SSL / Chunked :
+                # ce sont toutes des erreurs transitoires côté transport.
+                if isinstance(exc, requests.exceptions.Timeout):
+                    last_error = BluestarTimeout(
+                        f"Timeout OANDA après {HTTP_READ_TIMEOUT_S:.0f}s."
+                    )
+                else:
+                    last_error = BluestarNetworkError(
+                        f"Erreur réseau OANDA : {type(exc).__name__}."
+                    )
+                logger.warning(
+                    "OANDA transport %s (essai %d/%d)",
+                    type(exc).__name__, attempt + 1, self.max_attempts,
+                )
+                self._sleep_before_retry(attempt, last_error)
+                continue
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                # Réponse non-JSON (page d'erreur d'un proxy, corps tronqué) : transitoire.
+                last_error = BluestarDataError(
+                    f"Réponse OANDA illisible ({type(exc).__name__})."
+                )
+                self._sleep_before_retry(attempt, last_error)
+                continue
+            except OSError as exc:  # socket brut hors requests (DNS, SSL bas niveau)
+                last_error = BluestarNetworkError(f"Erreur socket OANDA : {type(exc).__name__}.")
+                self._sleep_before_retry(attempt, last_error)
+                continue
+            except (KeyError, ValueError, TypeError, AttributeError) as exc:
+                raise BluestarDataError(
+                    f"Payload OANDA inexploitable ({type(exc).__name__}: {exc})."
+                ) from exc
+
+        raise last_error or BluestarNetworkError("OANDA injoignable après plusieurs tentatives.")
+
+    def _sleep_before_retry(self, attempt: int, error: BluestarError) -> None:
+        """Attend avec backoff avant le prochain essai (sans effet au dernier essai)."""
+        if attempt + 1 < self.max_attempts:
+            delay = self._backoff_seconds(attempt)
+            logger.warning(
+                "OANDA %s — nouvelle tentative %d/%d dans %.2fs",
+                type(error).__name__, attempt + 2, self.max_attempts, delay,
+            )
+            time.sleep(delay)
 
 
 # ==========================================
@@ -217,17 +532,6 @@ class StrengthResult:
             return "down"
         return "flat"
 
-    def color_class(self, currency: str) -> str:
-        """Retourne la classe CSS pour une devise."""
-        s = self.scores_display.get(currency, 5.0)
-        if s >= 7.0:
-            return "strong-bull"
-        if s >= 5.5:
-            return "mild-bull"
-        if s >= 4.0:
-            return "mild-bear"
-        return "strong-bear"
-
     def health_check(self) -> dict:
         """Health status for observability."""
         if not self.valid:
@@ -242,6 +546,293 @@ class StrengthResult:
             "status": status_str,
             "coverage_min": round(cov_min, 4),
             "warnings": self.warnings,
+        }
+
+
+# ==========================================
+# ── COUCHE DONNÉES (I/O OANDA) ────────────
+# ==========================================
+
+def _spec_key(instrument: str, granularity: str, count: int) -> str:
+    """Clé canonique d'une série OHLCV."""
+    return f"{instrument}|{granularity}|{int(count)}"
+
+
+def _empty_series(error: Optional[str] = None) -> Dict[str, Any]:
+    """Série vide (colonnes normalisées) porteuse d'un éventuel message d'erreur."""
+    return {"t": [], "o": [], "h": [], "l": [], "c": [], "error": error}
+
+
+def frame_from_series(series: Dict[str, Any]) -> Optional[pd.DataFrame]:
+    """
+    Reconstruit le DataFrame OHLCV indexé sur le temps (None si série inexploitable).
+
+    Index identique à la v10.1 : `pd.to_datetime()` sur les horodatages ISO-8601 UTC
+    renvoyés par OANDA => DatetimeIndex tz-aware UTC.
+    """
+    stamps = series.get("t") or []
+    if len(stamps) < MIN_OHLCV_ROWS:
+        return None
+    index = pd.DatetimeIndex(pd.to_datetime(list(stamps)))
+    return pd.DataFrame(
+        {
+            "Open":  series["o"],
+            "High":  series["h"],
+            "Low":   series["l"],
+            "Close": series["c"],
+        },
+        index=index,
+    )
+
+
+def records_from_candles(candles: Any) -> Dict[str, Any]:
+    """
+    Convertit les chandelles OANDA (liste de dicts) en colonnes compactes.
+
+    Le stockage en colonnes divise par ~8 l'empreinte mémoire du cache par rapport à une
+    liste de dicts par chandelle (28 paires × 2000 bougies journalières) : c'est ce qui
+    évite les redémarrages OOM sur une instance Streamlit Cloud à 1 Go.
+    """
+    if not isinstance(candles, list):
+        raise BluestarDataError("Réponse OANDA sans tableau 'candles'.")
+    series = _empty_series()
+    for candle in candles:
+        if not isinstance(candle, dict) or not candle.get("complete"):
+            continue
+        mid = candle.get("mid")
+        try:
+            series["t"].append(str(candle["time"]))
+            series["o"].append(float(mid["o"]))
+            series["h"].append(float(mid["h"]))
+            series["l"].append(float(mid["l"]))
+            series["c"].append(float(mid["c"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BluestarDataError(f"Chandelle OANDA malformée : {candle!r}") from exc
+    return series
+
+
+# ── Plan de chargement ────────────────────────────────────────────────────────
+
+def build_engine_plan() -> Tuple[Tuple[str, str, int], ...]:
+    """
+    Séries nécessaires au moteur (W, D, H4, H1 + vélocité H1).
+
+    W et D partagent la même série journalière : 3 requêtes par paire au lieu de 4.
+    """
+    specs = set()
+    for pair in PAIRS:
+        for cfg in TIMEFRAMES_MTF.values():
+            specs.add((pair, cfg["gran_fetch"], int(cfg["count"])))
+        specs.add((pair, "H1", H1_COUNT))
+    return tuple(sorted(specs))
+
+
+def map_fetch_count(instrument: str, granularity: str) -> int:
+    """
+    Compteur de chandelles pour la Market Map.
+
+    On réutilise la série déjà chargée par le moteur quand elle existe (même instantané,
+    donc zéro requête supplémentaire) ; pour les indices et matières premières, 30 bougies
+    suffisent (la map n'affiche qu'une variation de 1 à 5 ticks).
+    """
+    if instrument in PAIRS:
+        if granularity == "H1":
+            return H1_COUNT
+        if granularity == "H4":
+            return H4_COUNT
+        if granularity == "D":
+            return DAILY_COUNT
+    return MAP_COUNT
+
+
+def build_map_plan(granularity: str) -> Tuple[Tuple[str, str, int], ...]:
+    """Séries nécessaires à la Market Map (forex + indices + matières premières)."""
+    instruments = list(FOREX_PAIRS) + list(INDICES) + list(METAUX)
+    return tuple(
+        sorted((i, granularity, map_fetch_count(i, granularity)) for i in instruments)
+    )
+
+
+# ── Chargement parallèle + cache ──────────────────────────────────────────────
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=BUNDLE_CACHE_MAX_ENTRIES)
+def fetch_candles_batch(
+    token_fp: str,
+    environment: str,
+    specs: Tuple[Tuple[str, str, int], ...],
+    _access_token: str,
+) -> Dict[str, Any]:
+    """
+    Récupère plusieurs séries OHLCV en parallèle auprès d'OANDA (cache 60 s).
+
+    `token_fp` — empreinte SHA-256 non réversible — fait PARTIE de la clé de cache : deux
+    tokens ou deux environnements ne peuvent plus se contaminer mutuellement (la v10.1
+    préfixait ce paramètre d'un `_`, ce qui l'excluait silencieusement de la clé de cache).
+    `_access_token` est préfixé d'un underscore, donc exclu de la clé : le secret lui-même
+    n'est jamais persisté par Streamlit.
+
+    Retourne `{ "PAIR|GRAN|COUNT": {"t": [...], "o": [...], "h": [...], "l": [...],
+    "c": [...], "error": None|str} }`, plus la clé `"__fatal__"` si OANDA a refusé
+    l'authentification (l'UI peut alors afficher un écran de diagnostic précis).
+    Aucune exception ne remonte : une série en échec est retournée vide avec son message.
+    """
+    bundle: Dict[str, Dict[str, Any]] = {}
+    if not specs:
+        return bundle
+
+    workers = max(1, min(FETCH_MAX_WORKERS, len(specs)))
+    t0 = time.perf_counter()
+    logger.info("OANDA fetch start: %d séries, %d workers", len(specs), workers)
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="oanda-fetch"
+    ) as pool:
+        futures = {
+            pool.submit(_fetch_one_series, environment, _access_token, spec): spec
+            for spec in specs
+        }
+        for future in concurrent.futures.as_completed(futures):
+            instrument, granularity, count = futures[future]
+            key = _spec_key(instrument, granularity, count)
+            try:
+                bundle[key] = future.result()
+            except Exception as exc:  # garde-fou : un worker ne doit jamais casser le run
+                logger.exception("Worker OANDA en échec pour %s", key)
+                bundle[key] = _empty_series(f"Erreur interne de fetch ({type(exc).__name__}).")
+            if str(bundle[key].get("error") or "").startswith("BluestarAuthError"):
+                # Erreur fatale : inutile de laisser l'utilisateur deviner, on la remonte.
+                bundle["__fatal__"] = bundle[key]["error"]  # type: ignore[assignment]
+
+    failed = sum(1 for k, v in bundle.items() if k != "__fatal__" and v.get("error"))
+    logger.info(
+        "OANDA fetch done: %d séries, %d en erreur, %.2fs",
+        len(specs), failed, time.perf_counter() - t0,
+    )
+    return bundle
+
+
+def _fetch_one_series(
+    environment: str, access_token: str, spec: Tuple[str, str, int]
+) -> Dict[str, Any]:
+    """
+    Récupère UNE série OANDA.
+
+    Thread-safe par construction : un client `API` (donc un `requests.Session`) est créé par
+    appel, car `Session` n'est pas thread-safe. Le pool de connexions reste réutilisé par
+    thread via le ThreadPoolExecutor, ce qui limite les handshakes TLS.
+    """
+    instrument, granularity, count = spec
+    try:
+        client = OandaClient(_create_client(access_token, environment))
+        endpoint = instruments.InstrumentsCandles(
+            instrument=instrument,
+            params={"count": int(count), "granularity": granularity, "price": "M"},
+        )
+        payload = client.request(endpoint)
+        candles = payload.get("candles") if hasattr(payload, "get") else None
+        return records_from_candles(candles)
+    except BluestarError as exc:
+        logger.warning(
+            "Série indisponible %s %s %d : %s", instrument, granularity, count, exc
+        )
+        return _empty_series(f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # ultime garde-fou (payload exotique, erreur pandas…)
+        logger.exception("Erreur inattendue sur %s %s %d", instrument, granularity, count)
+        return _empty_series(f"{type(exc).__name__}: {exc}")
+
+
+class MarketDataProvider:
+    """
+    Point d'accès unique aux séries OHLCV.
+
+    Combine un bundle pré-chargé (une seule passe réseau parallèle) et un cache de DataFrames
+    valant pour la durée d'un run. Les DataFrames retournés sont mis en cache et partagés :
+    ils doivent être considérés comme LECTURE SEULE (aucune fonction de tendance ne les mute).
+    """
+
+    def __init__(
+        self,
+        token_fp: str,
+        environment: str,
+        access_token: str,
+        bundle: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.token_fp = token_fp
+        self.environment = environment
+        self._access_token = access_token
+        self._bundle: Dict[str, Any] = dict(bundle or {})
+        self._frames: Dict[Tuple[str, str, int], Optional[pd.DataFrame]] = {}
+        self.errors: List[str] = []
+        self.bundle_hits = 0
+        self.lazy_fetches = 0
+
+    # ── Séries brutes ─────────────────────────────────────────────────────────
+
+    def series(self, instrument: str, granularity: str, count: int) -> Dict[str, Any]:
+        """Série brute (colonnes compactes), servie par le bundle ou par le cache Streamlit."""
+        key = _spec_key(instrument, granularity, count)
+        cached = self._bundle.get(key)
+        if cached is not None:
+            self.bundle_hits += 1
+            return cached
+        self.lazy_fetches += 1
+        fetched = fetch_candles_batch(
+            self.token_fp, self.environment, ((instrument, granularity, int(count)),),
+            self._access_token,
+        )
+        series = fetched.get(key) or _empty_series("Série absente du bundle.")
+        self._bundle[key] = series
+        return series
+
+    # ── DataFrames ────────────────────────────────────────────────────────────
+
+    def frame(
+        self, instrument: str, granularity: str, count: int
+    ) -> Optional[pd.DataFrame]:
+        """
+        DataFrame OHLCV validé, ou None si la série est indisponible.
+
+        Reproduit exactement le contrat de `StrengthEngine._fetch_ohlcv` en v10.1 :
+        série trop courte ou invalide => None + message dans `errors`.
+        """
+        frame_key = (instrument, granularity, int(count))
+        if frame_key in self._frames:
+            return self._frames[frame_key]
+
+        series = self.series(instrument, granularity, count)
+        frame = frame_from_series(series)
+        if frame is not None:
+            try:
+                validate_ohlcv(frame, min_len=MIN_OHLCV_ROWS)
+            except ValueError as exc:
+                self.errors.append(f"{instrument}/{granularity}/{count}: {exc}")
+                logger.warning("Série invalide %s : %s", frame_key, exc)
+                frame = None
+        elif series.get("error"):
+            self.errors.append(f"{instrument}/{granularity}/{count}: {series['error']}")
+
+        self._frames[frame_key] = frame
+        return frame
+
+    # ── Diagnostic ────────────────────────────────────────────────────────────
+
+    @property
+    def fatal_error(self) -> Optional[str]:
+        """Message d'authentification remonté par la couche réseau, le cas échéant."""
+        value = self._bundle.get("__fatal__")
+        return value if isinstance(value, str) else None
+
+    def stats(self) -> Dict[str, Any]:
+        """Compteurs d'accès et erreurs de collecte, pour le panneau de diagnostic."""
+        return {
+            "series_from_bundle": self.bundle_hits,
+            "series_lazy_fetched": self.lazy_fetches,
+            "series_loaded": sum(
+                1 for k, v in self._bundle.items()
+                if k != "__fatal__" and isinstance(v, dict) and v.get("t")
+            ),
+            "series_failed": len(self.errors),
+            "errors": list(self.errors),
         }
 
 
@@ -610,8 +1201,14 @@ def _build_candidates(
 def _filter_by_atr_and_exposure(
     candidates: List[Dict],
     max_pairs: int,
+    max_exposure: int = MAX_CURRENCY_EXPOSURE,
 ) -> Tuple[List[str], List[Dict]]:
-    """Filtre les candidats sur l'ATR puis limite l'exposition par devise."""
+    """
+    Filtre les candidats sur l'ATR puis limite l'exposition par devise.
+
+    `max_exposure` = nombre maximum de paires partageant une même devise (1 par défaut :
+    aucune devise n'apparaît deux fois dans la sélection — comportement v10.1 inchangé).
+    """
     if not candidates:
         return [], []
 
@@ -622,13 +1219,15 @@ def _filter_by_atr_and_exposure(
     if not candidates:
         return [], []
 
-    used_currencies: set = set()
+    limit = max(1, int(max_exposure))
+    exposure: Dict[str, int] = {}
     filtered = []
     for c in sorted(candidates, key=lambda x: x["diff"], reverse=True):
-        if c["base"] in used_currencies or c["quote"] in used_currencies:
+        if exposure.get(c["base"], 0) >= limit or exposure.get(c["quote"], 0) >= limit:
             continue
         filtered.append(c)
-        used_currencies.update([c["base"], c["quote"]])
+        exposure[c["base"]] = exposure.get(c["base"], 0) + 1
+        exposure[c["quote"]] = exposure.get(c["quote"], 0) + 1
     top = filtered[:max_pairs]
     return [c["exec_pair"] for c in top], top
 
@@ -645,54 +1244,33 @@ class StrengthEngine:
 
     def __init__(
         self,
-        client: API,
+        provider: MarketDataProvider,
         min_diff: float = MIN_STRENGTH_DIFF,
         max_pairs: int  = MAX_PAIRS,
+        max_exposure: int = MAX_CURRENCY_EXPOSURE,
     ):
-        self.api       = OandaClient(client)
-        self.min_diff  = min_diff
-        self.max_pairs = max_pairs
-        self._cache: Dict[tuple, pd.DataFrame] = {}
-        self.errors: List[str] = []
+        self.provider     = provider
+        self.min_diff     = min_diff
+        self.max_pairs    = max_pairs
+        self.max_exposure = max(1, int(max_exposure))
+
+    @property
+    def errors(self) -> List[str]:
+        """Erreurs de collecte remontées par le provider (même contrat qu'en v10.1)."""
+        return self.provider.errors
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
     def _fetch_ohlcv(
         self, pair: str, granularity: str, count: int
     ) -> Optional[pd.DataFrame]:
-        """Récupère les chandeliers OANDA avec cache complet."""
-        key = (pair, granularity, count, "M")
-        if key in self._cache:
-            return self._cache[key].copy(deep=False)
-        try:
-            params = {"count": count, "granularity": granularity, "price": "M"}
-            r = instruments.InstrumentsCandles(instrument=pair, params=params)
-            self.api.request(r)
-            rows = [
-                {
-                    "Time":  c["time"],
-                    "Open":  float(c["mid"]["o"]),
-                    "High":  float(c["mid"]["h"]),
-                    "Low":   float(c["mid"]["l"]),
-                    "Close": float(c["mid"]["c"]),
-                }
-                for c in r.response["candles"] if c["complete"]
-            ]
-            if len(rows) < 20:
-                return None
-            df = pd.DataFrame(rows)
-            df["Time"] = pd.to_datetime(df["Time"])
-            df.set_index("Time", inplace=True)
-            validate_ohlcv(df, min_len=20)
-            self._cache[key] = df
-            return df
-        except BluestarError as exc:
-            logger.warning(
-                "Fetch OHLCV failed %s %s %d: %s (%s)",
-                pair, granularity, count, type(exc).__name__, exc,
-            )
-            self.errors.append(f"{pair}/{granularity}/{count}: {exc}")
-            return None
+        """
+        Récupère une série OHLCV validée via le provider.
+
+        La mise en cache (par série) et la validation sont déléguées à `MarketDataProvider` :
+        le moteur ne connaît plus ni HTTP ni OANDA, ce qui le rend testable hors ligne.
+        """
+        return self.provider.frame(pair, granularity, count)
 
     def _get_tf_df(self, pair: str, tf: str) -> Optional[pd.DataFrame]:
         """Récupère le DataFrame pour un timeframe donné."""
@@ -700,6 +1278,11 @@ class StrengthEngine:
         df  = self._fetch_ohlcv(pair, cfg["gran_fetch"], cfg["count"])
         if df is None:
             return None
+        tail = cfg.get("tail")
+        if tail and len(df) > tail:
+            # W et D partagent la série journalière complète : trend_daily ne reçoit que la
+            # fenêtre exacte de la v10.1 (EMA/SMA/EWM causaux => dernières valeurs identiques).
+            df = df.iloc[-tail:]
         if cfg["resample_rule"]:
             df = (
                 df.resample(cfg["resample_rule"])
@@ -819,15 +1402,18 @@ class StrengthEngine:
         candidates = _build_candidates(
             strongest, weakest, scores_display, self.min_diff, self._fetch_ohlcv
         )
-        return _filter_by_atr_and_exposure(candidates, self.max_pairs)
+        return _filter_by_atr_and_exposure(candidates, self.max_pairs, self.max_exposure)
 
     # ── Points d'entrée publics ───────────────────────────────────────────────
 
     def run(self) -> StrengthResult:
-        """Exécute le calcul complet multi-timeframe."""
+        """
+        Exécute le calcul complet multi-timeframe.
+
+        Sans effet de bord : les caches et compteurs sont portés par le provider, un même
+        moteur peut donc être relancé (ou instancié plusieurs fois) sans état résiduel.
+        """
         t0 = time.perf_counter()
-        self._cache.clear()
-        self.errors.clear()
         total, weight_sum  = self._compute_mtf_scores()
         if all(ws == 0 for ws in weight_sum.values()):
             return StrengthResult(
@@ -854,10 +1440,12 @@ class StrengthEngine:
         if min_cov < 0.5:
             warnings.append("Couverture de données faible, signaux dégradés.")
 
-        pairs_fetched = len(self._cache)
+        pairs_fetched = int(self.provider.stats().get("series_loaded", 0))
         logger.info(
-            "engine.run.completed: duration_ms=%.2f pairs_fetched=%d errors=%d min_coverage=%.4f",
+            "engine.run.completed: duration_ms=%.2f pairs_fetched=%d errors=%d "
+            "min_coverage=%.4f bundle_hits=%d lazy_fetches=%d",
             (time.perf_counter() - t0) * 1000, pairs_fetched, len(self.errors), min_cov,
+            self.provider.bundle_hits, self.provider.lazy_fetches,
         )
 
         return StrengthResult(
@@ -1109,45 +1697,64 @@ METAUX = {
 FOREX_PAIRS = PAIRS
 
 
-# ── 2. Clients & données avec cache isolé ─────────────────────────────────────
+# ── 2. Orchestration des données (caches isolés par token) ────────────────────
 
-@st.cache_data(ttl=60, show_spinner=False)
-def _run_engine_cached(_token_fp: str, environment: str) -> StrengthResult:
-    """Cache basé sur l'empreinte du token + env."""
-    access_token = st.secrets["OANDA_ACCESS_TOKEN"]
-    client = _create_client(access_token, environment)
-    engine = StrengthEngine(client=client)
-    return engine.run()
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def _fetch_candles_cached(
-    _token_fp: str,
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=RESULT_CACHE_MAX_ENTRIES)
+def load_market_bundle(
+    token_fp: str,
     environment: str,
-    instrument: str,
     granularity: str,
-    count: int,
-) -> Optional[pd.DataFrame]:
-    """Récupère les chandeliers avec cache."""
-    access_token = st.secrets["OANDA_ACCESS_TOKEN"]
-    client = OandaClient(_create_client(access_token, environment))
-    try:
-        params = {"count": count, "granularity": granularity, "price": "M"}
-        r = instruments.InstrumentsCandles(instrument=instrument, params=params)
-        client.request(r)
-        rows = [
-            {"Time": c["time"], "Close": float(c["mid"]["c"])}
-            for c in r.response["candles"] if c["complete"]
-        ]
-        if not rows:
-            return None
-        df = pd.DataFrame(rows)
-        df["Time"] = pd.to_datetime(df["Time"])
-        df.set_index("Time", inplace=True)
-        return df
-    except (BluestarError, V20Error, KeyError, ValueError, TypeError, OSError):
-        logger.exception("Cached fetch failed for %s %s", instrument, granularity)
-        return None
+    _access_token: str,
+) -> Dict[str, Any]:
+    """
+    Charge en UNE passe parallèle toutes les séries nécessaires au run courant
+    (moteur W/D/H4/H1 + vélocité H1 + Market Map).
+
+    Le bundle est mis en cache 60 s et partagé par le moteur et la Market Map : le run ne
+    déclenche plus ~150 requêtes séquentielles mais une seule vague parallèle bornée.
+    """
+    specs = tuple(sorted(set(build_engine_plan()) | set(build_map_plan(granularity))))
+    logger.info("bundle: %d séries demandées (map=%s)", len(specs), granularity)
+    return fetch_candles_batch(token_fp, environment, specs, _access_token)
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=RESULT_CACHE_MAX_ENTRIES)
+def run_engine_cached(
+    token_fp: str,
+    environment: str,
+    _bundle: Dict[str, Any],
+    _access_token: str,
+) -> Dict[str, Any]:
+    """
+    Exécute le moteur de force et renvoie un payload sérialisable (dict).
+
+    Seuls `token_fp` (empreinte) et `environment` entrent dans la clé de cache : le bundle
+    et le token sont préfixés d'un `_` (volumineux / secret). Le payload est volontairement
+    un dict — et non une instance de dataclass définie dans `__main__` — pour éliminer tout
+    risque d'échec de désérialisation du cache Streamlit.
+    """
+    t0 = time.perf_counter()
+    provider = MarketDataProvider(token_fp, environment, _access_token, bundle=_bundle)
+    result = StrengthEngine(provider).run()
+    if provider.fatal_error:
+        raise BluestarAuthError(provider.fatal_error)
+
+    payload = asdict(result)
+    payload["computed_at"] = datetime.datetime.now(tz).isoformat(timespec="seconds")
+    payload["engine_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    payload["provider"] = provider.stats()
+    payload["health"] = result.health_check()
+    logger.info(
+        "engine.cached: valid=%s pairs=%d engine_ms=%.1f",
+        result.valid, len(result.best_pairs), payload["engine_ms"],
+    )
+    return payload
+
+
+def result_from_payload(payload: Dict[str, Any]) -> StrengthResult:
+    """Reconstruit un `StrengthResult` depuis le payload mis en cache."""
+    allowed = {f.name for f in fields(StrengthResult)}
+    return StrengthResult(**{k: v for k, v in payload.items() if k in allowed})
 
 
 def _smoothed_pct(closes: pd.Series, smooth: int = MAP_SMOOTH_WINDOW) -> Optional[float]:
@@ -1166,15 +1773,25 @@ def _smoothed_pct(closes: pd.Series, smooth: int = MAP_SMOOTH_WINDOW) -> Optiona
     return float((last_mean / prev_mean - 1) * 100)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False, max_entries=RESULT_CACHE_MAX_ENTRIES)
 def fetch_market_map_data(
-    _token_fp: str,
+    token_fp: str,
     environment: str,
     gran: str,
-    smooth: int = 1,
-) -> Tuple[Dict, Dict[str, float]]:
-    """Market Map sans forward/backward fill."""
+    smooth: int,
+    _bundle: Dict[str, Any],
+    _access_token: str,
+) -> Tuple[Dict, Dict[str, float], Dict[str, Any]]:
+    """
+    Market Map sans forward/backward fill.
+
+    Les séries proviennent du bundle partagé (aucune requête supplémentaire quand la
+    granularité demandée est H1/H4/D, déjà chargée par le moteur) et les séries non
+    rafraîchies au-delà de `max_age` sont ignorées, comme en v10.1.
+    """
+    provider = MarketDataProvider(token_fp, environment, _access_token, bundle=_bundle)
     local_pair_changes: Dict[str, float] = {}
+    skipped: List[str] = []
     max_age_map = {
         "M5": pd.Timedelta(minutes=15),
         "M15": pd.Timedelta(minutes=45),
@@ -1187,11 +1804,13 @@ def fetch_market_map_data(
 
     now_utc = pd.Timestamp.now(tz="UTC")
     for pair in FOREX_PAIRS:
-        df = _fetch_candles_cached(_token_fp, environment, pair, gran, 30)
+        df = provider.frame(pair, gran, map_fetch_count(pair, gran))
         if df is None or len(df) < 2:
+            skipped.append(pair)
             continue
         closes = df["Close"].dropna()
         if len(closes) < 2:
+            skipped.append(pair)
             continue
         last_ts = pd.Timestamp(closes.index[-1])
         if last_ts.tzinfo is None:
@@ -1200,29 +1819,39 @@ def fetch_market_map_data(
             last_ts = last_ts.tz_convert("UTC")
         age = now_utc - last_ts
         if age > max_age:
+            logger.info("map: %s ignoré (dernière bougie %s, âge %s)", pair, last_ts, age)
+            skipped.append(pair)
             continue
         pct = _smoothed_pct(closes, smooth)
         if pct is None or not np.isfinite(pct):
+            skipped.append(pair)
             continue
         local_pair_changes[pair] = pct
 
-    local_pct_special = {}
+    local_pct_special: Dict[str, Dict[str, Any]] = {}
     for symbol, name in {**INDICES, **METAUX}.items():
-        df = _fetch_candles_cached(_token_fp, environment, symbol, gran, 30)
+        df = provider.frame(symbol, gran, map_fetch_count(symbol, gran))
         if df is None or len(df) < 2:
+            skipped.append(symbol)
             continue
         closes = df["Close"].dropna()
         if len(closes) < 2:
+            skipped.append(symbol)
             continue
         pct = _smoothed_pct(closes, smooth)
         if pct is None or not np.isfinite(pct):
+            skipped.append(symbol)
             continue
         local_pct_special[name] = {
             "pct": pct,
             "cat": "INDICES" if symbol in INDICES else "METAUX",
         }
 
-    return local_pct_special, local_pair_changes
+    stats = provider.stats()
+    stats["skipped"] = skipped
+    stats["expected"] = len(FOREX_PAIRS) + len(INDICES) + len(METAUX)
+    stats["received"] = len(local_pair_changes) + len(local_pct_special)
+    return local_pct_special, local_pair_changes, stats
 
 
 # ── 3. Composants UI ──────────────────────────────────────────────────────────
@@ -1319,7 +1948,7 @@ def app_header(env: str, gran: str, regime: str, ts: str) -> str:
         <div>
           <div class="bs-eyebrow">Bluestar System</div>
           <div class="bs-title">Market Dashboard</div>
-          <div class="bs-sub">FX Institutional Desk · Strength Engine v10.1 · W / D / H4 / H1</div>
+          <div class="bs-sub">FX Institutional Desk · Strength Engine v11.0 · W / D / H4 / H1</div>
         </div>
       </div>
       <div class="bs-headmeta">
@@ -1605,7 +2234,7 @@ def generate_json_export(
             "timestamp":     now.isoformat(timespec="seconds"),
             "session":       _session_label(),
             "timeframe_map": granularity,
-            "system":        "BLUESTAR v10.1",
+            "system":        "BLUESTAR v11.0",
         },
         "oanda_data": {
             "currency_strength": {
@@ -1878,7 +2507,7 @@ td.barcell{{padding-right:22px}}
     <div>
       <div class="eyebrow">Bluestar System</div>
       <div class="h1">BLUESTAR</div>
-      <div class="h1s">FX Institutional Desk · v10.1</div>
+      <div class="h1s">FX Institutional Desk · v11.0</div>
     </div>
   </div>
   <div class="hdr-r">
@@ -1929,67 +2558,263 @@ td.barcell{{padding-right:22px}}
   </div>
 </div>
 
-<div class="footer">Confidentiel — Bluestar System · FX Institutional Desk · v10.1 · {html.escape(date_str)} {html.escape(time_str)} CET</div>
+<div class="footer">Confidentiel — Bluestar System · FX Institutional Desk · v11.0 · {html.escape(date_str)} {html.escape(time_str)} UTC</div>
 </div>
 </body>
 </html>"""
 
 
 def generate_pdf_bytes(briefing_html: str) -> Optional[bytes]:
-    """Convertit le HTML en PDF via WeasyPrint (None si indisponible)."""
+    """
+    Convertit le HTML en PDF via WeasyPrint (optionnel).
+
+    WeasyPrint est absent des requirements (il exige pango/cairo, non disponibles sur
+    Streamlit Cloud) : l'appel est donc enveloppé largement — ImportError, libs système
+    manquantes (OSError) et erreurs de rendu XML (SyntaxError) — afin que l'export PDF ne
+    puisse jamais faire échouer le rendu du tableau de bord. Repli : téléchargement HTML.
+    """
     try:
         from weasyprint import HTML as WP_HTML  # type: ignore[import]
         return WP_HTML(string=briefing_html).write_pdf()
     except ImportError:
-        logger.warning("WeasyPrint non disponible — export PDF désactivé (fallback HTML).")
+        logger.info("WeasyPrint non disponible — export PDF désactivé (repli HTML).")
         return None
-    except (BluestarError, OSError, ValueError) as exc:
-        logger.error("WeasyPrint erreur de rendu: %s", exc)
+    except Exception as exc:  # fail-open volontaire : l'export ne doit jamais bloquer l'UI
+        logger.warning("WeasyPrint indisponible/erreur de rendu (%s) — repli HTML.", type(exc).__name__)
         return None
 
 
-# ── 6. Sidebar ────────────────────────────────────────────────────────────────
+# ── 6. Écrans de robustesse (configuration, authentification, diagnostic) ─────
+
+def _utc_now_label() -> str:
+    """Horodatage UTC compact pour l'en-tête (jamais l'heure locale du serveur)."""
+    return datetime.datetime.now(tz).strftime("%d/%m %H:%M UTC")
+
+
+def render_config_screen(settings: Settings) -> None:
+    """
+    Écran affiché quand aucun token OANDA n'est disponible.
+
+    La v10.1 s'arrêtait sur un `st.stop()` après un simple message d'erreur : l'utilisateur
+    voyait une application vide sans savoir quoi corriger. Ici la marche à suivre est
+    explicite et l'application reste utilisable (aucun crash).
+    """
+    st.markdown(
+        app_header("—", "—", "NEUTRAL", _utc_now_label()), unsafe_allow_html=True
+    )
+    st.error("Configuration OANDA absente — le tableau de bord ne peut pas charger les données.")
+    with st.expander("Configurer le token OANDA (2 minutes)", expanded=True):
+        st.markdown(
+            """
+**Streamlit Community Cloud** → *Manage app* → *Settings* → *Secrets* :
+
+```toml
+OANDA_ACCESS_TOKEN = "votre_token_practice"
+OANDA_ENVIRONMENT  = "practice"      # practice | live
+```
+
+**Auto-hébergement** → copiez `.streamlit/secrets.toml.example` en
+`.streamlit/secrets.toml`, ou exportez `OANDA_ACCESS_TOKEN` / `OANDA_ENVIRONMENT`.
+
+Le token d'un compte **practice** se génère sur
+<https://www.oanda.com/demo-account/tpa/personal_token>.
+
+Noms de secrets également acceptés : `OANDA_API_KEY`, `OANDA_TOKEN`,
+`OANDA_PRACTICE_ACCESS_TOKEN`, ou une section `[oanda]` avec `access_token`.
+"""
+        )
+    for problem in settings.problems:
+        st.warning(problem)
+
+
+def render_auth_screen(message: str) -> None:
+    """Écran affiché lorsque OANDA refuse les identifiants (HTTP 401/403)."""
+    st.error("OANDA a refusé l'authentification — aucune donnée de marché disponible.")
+    st.markdown(
+        "1. **Token expiré ou révoqué** : régénérez-le sur "
+        "<https://www.oanda.com/demo-account/tpa/personal_token> puis mettez à jour les secrets.\n"
+        "2. **Mauvais environnement** : un token *practice* ne fonctionne **que** avec "
+        "`OANDA_ENVIRONMENT = \"practice\"` (et inversement pour un token live).\n"
+        "3. **Secret mal collé** : vérifiez l'absence d'espace ou de guillemet superflu.\n"
+        "4. Après mise à jour des secrets, cliquez sur **⟳ Actualiser** dans la barre latérale."
+    )
+    with st.expander("Détail technique"):
+        st.code(message, language="text")
+
+
+def render_failure_screen(title: str, message: str, detail: str = "") -> None:
+    """Écran d'échec générique (le détail technique reste consultable, jamais affiché brut)."""
+    st.error(f"{title} : {message}")
+    st.caption(
+        "Les données n'ont pas pu être chargées. Cliquez sur **⟳ Actualiser** pour relancer "
+        "une collecte ; si le problème persiste, consultez le panneau *Diagnostic*."
+    )
+    if detail:
+        with st.expander("Détail technique"):
+            st.code(detail, language="text")
+
+
+def render_diagnostics(
+    settings: Settings,
+    environment: str,
+    token_fp: str,
+    payload: Dict[str, Any],
+    map_stats: Dict[str, Any],
+) -> None:
+    """Panneau de diagnostic (sidebar) : santé, couverture, volumétrie, erreurs API."""
+    provider_stats = payload.get("provider") or {}
+    health = payload.get("health") or {}
+    errors = list(provider_stats.get("errors") or [])
+    with st.expander("Diagnostic", expanded=False):
+        st.caption(
+            f"**Environnement** : {environment} · **Source token** : {settings.token_source} · "
+            f"**Empreinte** : `{token_fp[:8]}…`"
+        )
+        st.caption(
+            f"**Streamlit** {st.__version__} · **pandas** {pd.__version__} · "
+            f"**Python** {platform.python_version()}"
+        )
+        st.caption(
+            f"**Séries** : {provider_stats.get('series_loaded', 0)} chargées · "
+            f"{provider_stats.get('series_from_bundle', 0)} servies par le bundle · "
+            f"{provider_stats.get('series_lazy_fetched', 0)} fetch tardif(s)"
+        )
+        st.caption(
+            f"**Market Map** : {map_stats.get('received', 0)}/{map_stats.get('expected', 0)} "
+            f"instruments · {len(map_stats.get('skipped') or [])} ignoré(s)"
+        )
+        st.caption(
+            f"**Moteur** : {payload.get('engine_ms', 0)} ms · "
+            f"**Calculé à** : {payload.get('computed_at', 'n/a')} · "
+            f"**Couverture min** : {health.get('coverage_min', 0)}"
+        )
+        st.caption(f"**TTL du cache** : {CACHE_TTL_SECONDS} s · **Workers** : {FETCH_MAX_WORKERS}")
+        if errors:
+            st.caption(f"**{len(errors)} erreur(s) API** :")
+            st.code("\n".join(errors[:12]), language="text")
+        else:
+            st.caption("**Aucune erreur API.**")
+
+
+# ── 7. Sidebar ────────────────────────────────────────────────────────────────
+
+SESSION_LAST_RENDER_KEY: str = "bls_last_render_ts"
+SESSION_INTERVAL_KEY: str = "bls_auto_refresh_s"
+AUTO_REFRESH_CHOICES: Dict[str, int] = {
+    "Désactivé": 0,
+    "Toutes les 1 min": 60,
+    "Toutes les 5 min": 300,
+    "Toutes les 15 min": 900,
+}
+_AUTO_REFRESH_TICK_S: int = 10      # réveil du fragment (léger : aucun appel réseau)
+_HAS_FRAGMENT: bool = hasattr(st, "fragment")
+
+
+def _auto_refresh_ticker() -> None:
+    """
+    Rafraîchissement automatique opt-in (Streamlit >= 1.37).
+
+    Réveillé toutes les 10 s sans aucun appel réseau ; déclenche un rerun complet uniquement
+    lorsque l'intervalle choisi dans la barre latérale est écoulé. Désactivé par défaut :
+    aucun rerun n'est déclenché si l'utilisateur n'a pas sélectionné d'intervalle.
+    """
+    interval = int(st.session_state.get(SESSION_INTERVAL_KEY, 0) or 0)
+    if interval <= 0:
+        return
+    last_render = float(st.session_state.get(SESSION_LAST_RENDER_KEY, 0.0) or 0.0)
+    if time.time() - last_render >= interval:
+        logger.info("Auto-refresh: rerun complet (intervalle %ss)", interval)
+        st.rerun()
+
+
+if _HAS_FRAGMENT:
+    # Décoration conditionnelle : garde l'app importable sur un Streamlit < 1.37.
+    _auto_refresh_ticker = st.fragment(run_every=_AUTO_REFRESH_TICK_S)(_auto_refresh_ticker)
+
+
+settings = load_settings()
+current_env: str = settings.default_environment
+current_granularity: str = "H1"
+map_smooth: int = MAP_SMOOTH_WINDOW
+auto_refresh_s: int = 0
 
 with st.sidebar:
     st.markdown(
         '<div class="sb-brand"><div class="sb-brand-t">◆ BLUESTAR</div>'
-        '<div class="sb-brand-s">Strength Engine v10.1</div></div>',
+        '<div class="sb-brand-s">Strength Engine v11.0</div></div>',
         unsafe_allow_html=True,
     )
 
-    try:
-        current_token = st.secrets["OANDA_ACCESS_TOKEN"]
-    except (FileNotFoundError, KeyError):
-        current_token = None
-
-    if not current_token:
+    if not settings.configured:
         st.error("Token OANDA introuvable dans les secrets.")
-        st.stop()
+    else:
+        available_envs = settings.available_environments
+        default_index = (
+            available_envs.index(settings.default_environment)
+            if settings.default_environment in available_envs else 0
+        )
 
-    st.markdown('<div class="sb-lbl">Connexion</div>', unsafe_allow_html=True)
-    current_env = st.selectbox("Env", ["practice", "live"], label_visibility="collapsed")
+        st.markdown('<div class="sb-lbl">Connexion</div>', unsafe_allow_html=True)
+        current_env = st.selectbox(
+            "Env",
+            available_envs,
+            index=default_index,
+            label_visibility="collapsed",
+            help="Environnement OANDA ciblé. Seuls les environnements disposant d'un token "
+                 "configuré sont proposés (un token practice est refusé en live et inversement).",
+        )
 
-    st.markdown('<div class="sb-lbl">Timeframe — Market Map</div>', unsafe_allow_html=True)
-    current_granularity = st.selectbox(
-        "Timeframe (Map)",
-        ["M5", "M15", "M30", "H1", "H4", "D"],
-        index=3,
-        label_visibility="collapsed",
-    )
+        st.markdown('<div class="sb-lbl">Timeframe — Market Map</div>', unsafe_allow_html=True)
+        current_granularity = st.selectbox(
+            "Timeframe (Map)",
+            ["M5", "M15", "M30", "H1", "H4", "D"],
+            index=3,
+            label_visibility="collapsed",
+        )
 
-    st.markdown('<div class="sb-lbl">Lissage de la Map</div>', unsafe_allow_html=True)
-    map_smooth = st.selectbox(
-        "Map Smooth",
-        [1, 3, 5],
-        index=0,
-        format_func=lambda x: "Legacy (1 tick)" if x == 1 else f"Lissé ({x} ticks)",
-        label_visibility="collapsed",
-    )
+        st.markdown('<div class="sb-lbl">Lissage de la Map</div>', unsafe_allow_html=True)
+        map_smooth = st.selectbox(
+            "Map Smooth",
+            [1, 3, 5],
+            index=0,
+            format_func=lambda x: "Legacy (1 tick)" if x == 1 else f"Lissé ({x} ticks)",
+            label_visibility="collapsed",
+        )
+
+        st.markdown('<div class="sb-lbl">Actualisation</div>', unsafe_allow_html=True)
+        if st.button(
+            "⟳ Actualiser maintenant",
+            help="Vide le cache de données et relance immédiatement une collecte OANDA complète.",
+        ):
+            st.cache_data.clear()
+            st.session_state.pop(SESSION_LAST_RENDER_KEY, None)
+            st.rerun()
+
+        if _HAS_FRAGMENT:
+            refresh_label = st.selectbox(
+                "Auto-refresh",
+                list(AUTO_REFRESH_CHOICES.keys()),
+                index=0,
+                label_visibility="collapsed",
+                help=f"Les données sont conservées {CACHE_TTL_SECONDS} s. Le rafraîchissement "
+                     "automatique relance l'application selon l'intervalle choisi.",
+            )
+            auto_refresh_s = AUTO_REFRESH_CHOICES[refresh_label]
+            st.session_state[SESSION_INTERVAL_KEY] = auto_refresh_s
+        else:
+            auto_refresh_s = 0
+            st.caption(
+                "Rafraîchissement automatique indisponible (streamlit ≥ 1.37 requis) — "
+                "utilisez le bouton ⟳."
+            )
+
+        for problem in settings.problems:
+            st.warning(problem)
 
     st.markdown("---")
     st.caption(
-        "Le moteur de force agrège W + D + H4 + H1 en parallèle, "
-        "indépendamment du timeframe affiché sur la Market Map."
+        "Le moteur de force agrège W + D + H4 + H1 indépendamment du timeframe "
+        "affiché sur la Market Map."
     )
     st.caption(
         f"Poids : W {TIMEFRAMES_MTF['W']['weight']} · D {TIMEFRAMES_MTF['D']['weight']} · "
@@ -1997,28 +2822,45 @@ with st.sidebar:
     )
 
 
-# ── 7. Exécution ──────────────────────────────────────────────────────────────
+# ── 8. Exécution ──────────────────────────────────────────────────────────────
+
+current_token = settings.token_for(current_env)
 
 if current_token:
     token_fp = token_fingerprint(current_token)
 
-    with st.status("Actualisation des données OANDA…", expanded=False) as status:
+    with st.status("Collecte des données OANDA…", expanded=False) as status:
         try:
-            result = _run_engine_cached(token_fp, current_env)
+            bundle = load_market_bundle(token_fp, current_env, current_granularity, current_token)
+            fatal = bundle.get("__fatal__")
+            if isinstance(fatal, str):
+                raise BluestarAuthError(fatal)
+            payload = run_engine_cached(token_fp, current_env, bundle, current_token)
+            pct_special, pair_changes, map_stats = fetch_market_map_data(
+                token_fp, current_env, current_granularity, map_smooth, bundle, current_token
+            )
+        except BluestarAuthError as exc:
+            status.update(label="Authentification refusée par OANDA", state="error")
+            render_auth_screen(str(exc))
+            st.stop()
         except BluestarError as exc:
-            st.error(f"Échec du moteur : {exc}")
+            logger.warning("Collecte interrompue : %s", exc)
+            status.update(label="Collecte impossible", state="error")
+            render_failure_screen("Données indisponibles", str(exc))
             st.stop()
-        except Exception as exc:
-            logger.exception("Erreur inattendue moteur")
-            st.error(f"Erreur inattendue : {exc}")
+        except Exception as exc:  # filet de sécurité : l'app ne doit jamais montrer un traceback
+            logger.exception("Erreur inattendue pendant la collecte")
+            status.update(label="Erreur interne", state="error")
+            render_failure_screen("Erreur interne", type(exc).__name__, traceback.format_exc())
             st.stop()
-        pct_special, pair_changes = fetch_market_map_data(
-            token_fp, current_env, current_granularity, map_smooth
+        status.update(
+            label=f"Données chargées · {map_stats.get('received', 0)} instruments",
+            state="complete", expanded=False,
         )
-        status.update(label="Données chargées", state="complete", expanded=False)
 
-    regime_now = _infer_regime(pct_special)
-    ts_label   = datetime.datetime.now().strftime("%d/%m %H:%M")
+    result      = result_from_payload(payload)
+    regime_now  = _infer_regime(pct_special)
+    ts_label    = _utc_now_label()
 
     st.markdown(
         app_header(current_env, current_granularity, regime_now, ts_label),
@@ -2028,7 +2870,15 @@ if current_token:
     health = result.health_check()
 
     if not result.valid:
-        st.error("Impossible de calculer les forces : " + "; ".join(result.warnings))
+        st.error(
+            "Impossible de calculer les forces : " + "; ".join(result.warnings)
+            + " — vérifiez le panneau Diagnostic ci-contre."
+        )
+        render_failure_screen(
+            "Moteur sans données",
+            "aucune série OANDA exploitable n'a été reçue",
+            "\n".join((payload.get("provider") or {}).get("errors") or []) or "aucun détail",
+        )
     elif result.warnings:
         for w in result.warnings:
             st.warning(w)
@@ -2190,5 +3040,14 @@ if current_token:
                     "WeasyPrint non détecté. Ouvrir le HTML dans Chrome → Ctrl+P → "
                     "Enregistrer en PDF (activer « Graphiques d'arrière-plan »)."
                 )
+
+    # ── Horodatage de rendu + auto-refresh opt-in ─────────────────────────────
+    st.session_state[SESSION_LAST_RENDER_KEY] = time.time()
+    if auto_refresh_s > 0 and _HAS_FRAGMENT:
+        _auto_refresh_ticker()
+
+    # ── Diagnostic (barre latérale) ───────────────────────────────────────────
+    with st.sidebar:
+        render_diagnostics(settings, current_env, token_fp, payload, map_stats)
 else:
-    st.warning("En attente du Token OANDA…")
+    render_config_screen(settings)

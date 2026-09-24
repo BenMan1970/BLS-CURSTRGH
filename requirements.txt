@@ -1,5 +1,12 @@
-streamlit>=1.35,<2
+# BLUESTAR v11.0 — dépendances de déploiement (Streamlit Cloud)
+streamlit>=1.37,<2      # >=1.37 requis pour st.fragment (auto-refresh opt-in)
 oandapyV20==0.7.2
 pandas>=2.0,<3
 numpy>=1.26,<2
-requests>=2.31,<3
+requests>=2.31,<3       # timeouts HTTP explicites injectés via request_params
+
+# Notes :
+# * weasyprint est volontairement EXCLU : ses dépendances natives (Pango/Cairo) ne sont
+#   pas disponibles sur Streamlit Cloud. Sans lui, l'app propose le briefing HTML à
+#   imprimer en PDF (chemin fail-open testé).
+# * Dev/tests uniquement : pytest (la suite est 100 % hors ligne, voir tests/).
