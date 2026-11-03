@@ -4,6 +4,7 @@ oandapyV20==0.7.2
 pandas>=2.0,<3
 numpy>=1.26,<2
 requests>=2.31,<3       # timeouts HTTP explicites injectés via request_params
+six
 
 # Notes :
 # * weasyprint est volontairement EXCLU : ses dépendances natives (Pango/Cairo) ne sont
